@@ -1,0 +1,21 @@
+# Phase-1 DSB SocialNetwork overrides: pin image versions (reproducibility) + keep HPA off.
+# Deployed into ambient namespace `dsb`. Placement refined later for interference topology.
+global:
+  defaultImageVersion: "0.4.1"      # pin DSB microservices (was :latest)
+  hpa:
+    enabled: false
+  redis:
+    standalone:
+      enabled: true
+  memcached:
+    standalone:
+      enabled: true
+  mongodb:
+    standalone:
+      enabled: true
+
+# Jaeger: avoid broken :latest → pin 1.76.0 (key path matches jaeger subchart)
+jaeger:
+  container:
+    image: jaegertracing/all-in-one
+    imageVersion: "1.76.0"

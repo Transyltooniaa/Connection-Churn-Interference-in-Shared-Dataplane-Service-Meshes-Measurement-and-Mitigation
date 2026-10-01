@@ -1,0 +1,15 @@
+== [1] neutralize aws-node (VPC CNI) so Cilium owns networking ==
+daemonset.apps/aws-node patched (no change)
+== [2] install Cilium 1.20.2 (ENI mode; keep kube-proxy; ambient-safe settings) ==
+Pulled: quay.io/cilium/charts/cilium:1.20.2
+Digest: sha256:a7c12d330dd96bfcda3bf057b24be8f36566c34868265f930f776dff6f42d838
+Error: INSTALLATION FAILED: cannot re-use a name that is still in use
+== [3] wait for Cilium + node readiness ==
+Waiting for daemon set "cilium" rollout to finish: 0 of 2 updated pods are available...
+error: timed out waiting for the condition
+NAME                                           STATUS   ROLES    AGE   VERSION                INTERNAL-IP      EXTERNAL-IP     OS-IMAGE                        KERNEL-VERSION                     CONTAINER-RUNTIME
+ip-192-168-11-9.us-east-2.compute.internal     Ready    <none>   13m   v1.33.13-eks-a887778   192.168.11.9     3.149.243.208   Amazon Linux 2023.12.20260914   6.12.103-127.188.amzn2023.x86_64   containerd://2.2.7+unknown
+ip-192-168-58-146.us-east-2.compute.internal   Ready    <none>   13m   v1.33.13-eks-a887778   192.168.58.146   3.134.99.211    Amazon Linux 2023.12.20260914   6.12.103-127.188.amzn2023.x86_64   containerd://2.2.7+unknown
+== [4] Cilium status (bandwidth manager / EDT / BBR) ==
+== [5] install Istio 1.31 ambient ==
+client version: 1.31.0

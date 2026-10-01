@@ -1,0 +1,617 @@
+% ============================================================================
+% Compiles with the standard `article` class (no special packages needed), so it
+% builds anywhere (Overleaf, texlive, etc.). To submit to an ACM venue, replace
+% this preamble block with the acmart version noted in README.md.
+% ============================================================================
+\documentclass[10pt,twocolumn]{article}
+
+\usepackage[margin=0.75in]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{amsmath}
+\usepackage[hidelinks]{hyperref}
+\usepackage{authblk}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,backgrounds,fit}
+
+\renewcommand\Authfont{\normalsize}
+\renewcommand\Affilfont{\small\itshape}
+\setlength{\affilsep}{0.3em}
+
+\title{\textbf{Connection-Churn Interference in Shared-Dataplane Service Meshes:
+Measurement and Mitigation}}
+
+\author[]{Ajitesh Kumar Singh}
+\author[]{Shashank Tippanavar}
+\affil[]{IIIT Bangalore}
+\date{}
+
+\begin{document}
+\twocolumn[{%
+\maketitle
+\begin{center}
+\begin{minipage}{0.86\textwidth}
+{\centering\textbf{Abstract}\par}\medskip
+\small
+Istio's ambient mode reduces the cost of a service mesh by replacing the per-pod sidecar
+proxy with a single shared proxy (\emph{ztunnel}) per node. This design improves resource
+efficiency but introduces a new failure mode: because all pods on a node share one proxy,
+a single workload can degrade co-located neighbors through the proxy alone, without
+saturating their CPU, their application code, or the network.
+
+We study this shared-proxy interference on a standard microservice benchmark
+(DeathStarBench Social Network) running on a managed Kubernetes cluster with Cilium and
+Istio ambient, and report three findings. First, two distinct causes---connection
+\emph{churn} (many short-lived, TLS-bearing connections) and shared application-backend
+saturation---produce the same victim symptom (median latency remains stable while the
+99th-percentile tail inflates by roughly $17\times$) yet leave opposite signatures inside
+the proxy. Second, proxy saturation behaves as a threshold: it engages sharply and
+provides no early warning, so an effective mitigation must react rather than predict.
+Third, the scarce resource is the proxy's connection-handling capacity, which conventional
+QoS mechanisms do not observe. We show that Cilium's Bandwidth Manager, the closest
+existing mechanism, cannot mitigate connection churn even under an aggressive cap, because
+it paces bytes while a large number of small connections remain within any reasonable byte
+budget.
+
+Guided by these findings, we build a closed-loop controller that monitors a single proxy
+saturation signal and, when the proxy is overloaded, paces the aggressor's new-connection
+rate. Over $n{=}12$ trials it reduces victim tail latency from $47\,$ms to $3.7\,$ms
+($12.7\times$, within 30\% of the interference-free baseline; Mann--Whitney
+$p{<}10^{-4}$) while continuing to serve the aggressor, adds $9\,$ns per packet at the
+enforcement primitive, and imposes no measurable overhead when the proxy is unsaturated. The underlying principle generalizes: in a
+shared-dataplane mesh, measure the resource that is actually scarce, at the point where it
+is scarce, and control the input that consumes it.
+\end{minipage}
+\end{center}
+\vspace{1.2em}
+}]
+
+\section{Introduction}
+A service mesh provides a dedicated infrastructure layer for microservice
+communication---encryption, retries, and telemetry---so that these concerns are handled
+outside application code. The conventional design places a proxy \emph{sidecar} alongside
+every pod. This gives each pod an isolated proxy but is resource-intensive: a large
+deployment runs hundreds of proxy instances, each consuming memory and CPU.
+
+Istio's \emph{ambient} mode removes the sidecars. Each node instead runs a single shared
+proxy, \emph{ztunnel}, that handles the layer-4 traffic (mutual TLS, telemetry) for all
+pods on that node. This improves resource efficiency and is a primary reason ambient mode
+is being adopted. However, sharing a proxy also shares a failure domain: if one pod
+overloads its node's ztunnel, every other pod routed through it can be affected---including
+pods that are otherwise idle and well within their own resource limits.
+
+This paper studies that effect and asks three questions, each answered with measurements
+on a running system:
+\begin{enumerate}
+\item \emph{Does it occur?} Can one workload degrade a co-located neighbor purely through
+the shared proxy, with the neighbor's own resources unsaturated? We show that it can, and
+we separate this from a similar-looking cause (shared application backends).
+\item \emph{What signal exposes it, and does it provide early warning?} We find that the
+proxy's own telemetry detects and classifies the condition almost perfectly, but only as
+it occurs, not in advance.
+\item \emph{Can it be mitigated, and why do existing tools not already do so?} A small
+reactive controller mitigates it; existing tools miss it because they observe and control
+the wrong resource.
+\end{enumerate}
+
+Our central observation is a mismatch between what conventional infrastructure tools
+control and what is actually scarce. Autoscalers add application CPU; bandwidth managers
+pace bytes. But the resource a shared mesh proxy exhausts first, under an adversarial or
+misbehaving neighbor, is its capacity to \emph{establish connections}: each new mutual-TLS
+handshake is comparatively expensive in CPU while carrying almost no application bytes. A
+workload that opens many short-lived connections (\emph{connection churn}) can therefore
+saturate the shared proxy while appearing benign to any byte- or application-CPU-based
+tool. We demonstrate this directly---Cilium's Bandwidth Manager, which paces bytes, does
+not mitigate churn---and show that pacing the correct quantity, the new-connection rate,
+triggered by a proxy-saturation signal, restores victim tail latency by $12.7\times$.
+
+\paragraph{Contributions.}
+\begin{itemize}
+\item A controlled characterization, on a standard microservice benchmark, showing that
+shared-proxy interference is real and separating it from application-backend
+contention---two causes with an identical victim symptom but opposite proxy signatures
+(\S\ref{sec:char}).
+\item An empirical signal study showing the proxy's telemetry is a near-perfect
+\emph{binary detector} and \emph{mechanism classifier}, but not a graded predictor and
+not an early-warning signal---which dictates a reactive, not predictive, controller
+(\S\ref{sec:signal}).
+\item A closed-loop connection-rate controller that restores victim tail latency
+$12.7\times$, with a $9\,$ns/packet data-plane cost and a true no-op when healthy
+(\S\ref{sec:mitigation}).
+\item A head-to-head result showing why the closest existing mechanism (byte-rate
+pacing) cannot address this interference class, and why the usual escape hatch
+(autoscaling) structurally does not apply to a shared proxy (\S\ref{sec:diff}).
+\end{itemize}
+
+\section{Background and Setup}
+\label{sec:setup}
+\paragraph{Ambient mode.} In Istio ambient mode, a per-node DaemonSet
+process (ztunnel, written in Rust on the Tokio async runtime) transparently intercepts
+the L4 traffic of every meshed pod on its node and tunnels it over mutual TLS. There is
+exactly one ztunnel per node and it is not something an application can scale
+out---unlike an optional per-namespace ``waypoint'' proxy, a tenant cannot spin up more
+ztunnels to escape contention. That singleton, always-in-the-path property is exactly
+what makes it worth studying.
+
+\paragraph{Testbed.} We run on Amazon EKS (Kubernetes 1.33) with non-burstable
+\texttt{c6i.2xlarge} nodes (8 vCPU), Cilium 1.20 as the CNI (overlay mode), and Istio
+1.31 in ambient mode. The workload is the DeathStarBench Social Network benchmark (27
+microservices: C++/Thrift services with MongoDB, Redis, and memcached backends). We
+drive it with the open-loop \texttt{wrk2} generator (which avoids coordinated omission)
+and report latency percentiles from full HDR histograms. Our victim is the
+\texttt{home-timeline} read endpoint held at a fixed 100 requests/s.
+
+\paragraph{Isolating the proxy.} To attribute effects to the shared proxy rather than to
+a full node, we (i) co-locate all workloads and the ztunnel on one ``under-test'' node,
+(ii) \emph{cap ztunnel's CPU at one core} so it saturates while the 8-core node still has
+plenty of headroom, and (iii) run the load generator on a separate node. At every data
+point we report node CPU and the ztunnel's own CPU/throttling so a reader can see that
+the node is not the bottleneck. Because ztunnel is a distroless image, we read its cgroup
+CPU counters from the node and scrape its Tokio runtime metrics over the network.
+
+\paragraph{A note on rigor.} Latency is heavy-tailed and runs vary, so every headline
+number is a mean over repeated trials with the spread reported; load-level order is
+randomized across trials; and we lead with the strongest, most reproducible framing of
+each result. Where a result is a smaller pilot ($n{=}3$) rather than a full sweep, we say
+so.
+
+\paragraph{On the eBPF enforcer and Cilium.}
+\label{sec:setup-ebpf}
+Our data-path enforcer is an eBPF program attached to the aggressor pod's virtual
+interface that rate-limits connection-initiating (SYN) packets via a token bucket in a
+BPF map that the control loop updates. It compiles and load-verifies, and we benchmark it
+in isolation (\S\ref{sec:diff}). One integration wrinkle is worth stating up front so our
+numbers are not over-read: Cilium attaches its own program to the same interface via the
+newer \emph{tcx} hook, which executes ahead of the classic TC hook, so a program attached
+the classic way never sees the packets. Attaching ours with explicit tcx ordering (ahead
+of Cilium's) is the correct production path but requires tooling we treat as engineering.
+To keep the \emph{measured} results honest we therefore enforce the identical
+new-connection-rate policy at the connection-admission layer for all closed-loop
+experiments; since both enforce the same cap, they are equivalent for the victim-facing
+outcome, and we flag the eBPF-in-CNI integration as the one piece not yet wired
+end-to-end.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Victim 99th-percentile latency across conditions. The shared-proxy attack
+inflates the tail $\sim$16$\times$; byte-rate pacing does not mitigate it; connection-rate
+pacing restores it. Values are mean with 95\% bootstrap CI. The core comparison
+(baseline/unmitigated/ours) uses $n{=}12$ trials; the two Bandwidth Manager rows use
+$n{=}3$.}
+\label{tab:summary}
+\begin{tabular}{lcr}
+\toprule
+Condition & $n$ & Victim P99 (ms) \\
+\midrule
+No aggressor (baseline)              & 12 & $2.9$ \,[2.8, 2.9] \\
+Connection-churn attack, unmitigated & 12 & $47.0$ [36, 57] \\
+\;+ Cilium Bandwidth Manager (1\,Mbit)   & 3 & $56.5 \pm 3.2$ \\
+\;+ Cilium Bandwidth Manager (256\,kbit) & 3 & $29.2 \pm 13.1$ \\
+\;+ \textbf{Ours (connection-rate pacing)} & 12 & $\mathbf{3.7}$ \,[3.6, 3.8] \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Evaluation Overview}
+\label{sec:eval}
+Our evaluation answers five questions, each in a following section:
+\textbf{(Q1)} Does interference occur purely through the shared proxy, with the victim's own
+resources unsaturated, and can it be distinguished from application-backend contention?
+(\S\ref{sec:char})
+\textbf{(Q2)} Which proxy signal exposes the condition, and does it provide early warning?
+(\S\ref{sec:signal})
+\textbf{(Q3)} Does a reactive connection-rate controller restore victim tail latency while
+continuing to serve the aggressor? (\S\ref{sec:mitigation})
+\textbf{(Q4)} Do existing mechanisms (byte-rate pacing, autoscaling) address this
+interference? (\S\ref{sec:diff})
+\textbf{(Q5)} What is the overhead, and how sensitive is the controller to its parameters?
+(\S\ref{sec:overhead})
+All experiments use the testbed and methodology of \S\ref{sec:setup} (managed EKS, Cilium
+1.20, Istio 1.31 ambient; victim held at 100\,req/s; open-loop \texttt{wrk2}; HDR
+histograms; repeated trials with randomized ordering).
+
+\section{Shared-Proxy Interference and Its Signatures}
+\label{sec:char}
+We inject two kinds of aggressor, both co-located on the victim's node, and sweep their
+intensity. The first is a \emph{connection-churn} aggressor that repeatedly opens and
+closes connections to a dummy service that shares \emph{only} the ztunnel with the victim
+(no shared application backend). The second is a \emph{compose-post} aggressor: a real
+DeathStarBench write workload that shares application backends (post-storage, user,
+Redis) with the victim's read path.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{figs/fig_two_mechanisms.pdf}
+\caption{Two aggressors produce the \emph{same} victim symptom (a) but leave
+\emph{opposite} fingerprints in the proxy (b). Connection churn saturates ztunnel's
+capped CPU; the backend aggressor degrades the victim while leaving ztunnel nearly idle.
+Error bars are $\pm$1 SD over 5 (churn) / 3 (compose) trials.}
+\label{fig:two}
+\end{figure}
+
+\paragraph{The victim symptom.} Figure~\ref{fig:two}(a) shows the effect. With no
+aggressor, the victim's P99 sits at $2.9\,$ms. Under connection churn it jumps to
+$\sim$50\,ms---a $17$--$18\times$ tail amplification---while the victim's \emph{median}
+latency barely moves (it stays near $2\,$ms). This ``flat median, exploding tail''
+signature is exactly why the problem is easy to miss: a dashboard watching average
+latency sees nothing.
+
+\paragraph{It is the proxy, not the node.} Throughout the churn sweep the under-test node
+sits at only $\sim$30\% CPU, while ztunnel is pinned at its 1-core cap and is actively
+CPU-throttled ($\sim$680 throttle events per minute). The victim's own service is
+untouched. The only shared, saturated resource is the proxy---so the interference is
+attributable to it and not to node exhaustion or application code.
+
+\paragraph{A second, distinct cause.} The compose-post aggressor produces an
+almost identical victim symptom (Figure~\ref{fig:two}a, blue): no effect until a
+threshold, then a violent tail blow-up ($95\times$ at high load). But its proxy
+fingerprint is the \emph{opposite} (Figure~\ref{fig:two}b): ztunnel stays near-idle
+($<0.1$ core, zero throttling). Here the bottleneck is a shared application backend
+saturating, not the proxy. This matters for two reasons. It is a confound we must rule
+out to make an honest ``shared-proxy'' claim---which the disjoint-backend churn aggressor
+does. And it foreshadows the signal question: the victim cannot tell the two apart, but,
+as we show next, the proxy can (Figure~\ref{fig:sig}).
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.82\linewidth]{figs/fig_signature.pdf}
+\caption{The same victim tail arises from two regimes with opposite proxy-CPU
+signatures. Proxy CPU is diagnostic of \emph{which} problem is occurring, not of
+\emph{how bad} the victim tail is.}
+\label{fig:sig}
+\end{figure}
+
+\paragraph{It is a threshold, not a dial.} A practically important detail:
+the churn effect is a \emph{step}. Even our lowest churn setting already pins ztunnel at
+its cap, so pushing harder does not make things proportionally worse---the proxy is
+simply saturated or it is not. This shapes everything that follows: if the problem has no
+gentle ramp, there is little to predict, and a good controller should react quickly at
+the threshold rather than try to forecast severity.
+
+\section{Signal Selection}
+\label{sec:signal}
+A mitigation needs something to watch. We recorded ztunnel's observable
+signals---connection rate, worker busy-time, in-flight task count, CPU throttling---at
+high cadence (every $\sim$200\,ms) across five trials while an aggressor switched on
+mid-trace, and asked three questions of each signal.
+
+\paragraph{(1) Does it track how \emph{bad} the tail is?} No. Within the saturated
+regime (excluding the on/off transition), the correlation between any proxy signal and
+the victim's P99 is essentially zero (worker busy-rate: $r={-}0.06\pm0.27$; in-flight
+tasks: $r={-}0.38\pm0.15$). This is the honest consequence of the threshold in
+\S\ref{sec:char}: once the proxy is saturated, its telemetry does not encode \emph{how
+much} the victim is hurting. We therefore do \emph{not} claim a predictive signal.
+
+\paragraph{(2) Does it detect \emph{whether} the proxy is saturated?} Almost perfectly.
+Figure~\ref{fig:detector} shows the worker busy-rate is cleanly bimodal: idle
+(median $0.0$, 95th pct $0.05$) versus loaded (median $2.0$, 5th pct $1.8$)---a $38\times$
+gap with no overlap. A single fixed threshold separates the two states with 100\%
+accuracy across $\sim$1000 samples. So the proxy is a superb \emph{binary detector} of
+its own saturation.
+
+\paragraph{(3) Can it tell the two mechanisms apart?} Yes. CPU throttling is nonzero only
+under proxy (churn) saturation and stays exactly zero under backend saturation, while
+in-flight task count rises in both. So a simple rule---\emph{throttling $>0$ means the
+proxy is the problem; throttling $=0$ but tasks rising means a backend is}---classifies
+the mechanism from the proxy's telemetry alone (Figure~\ref{fig:classify}).
+
+\begin{figure}[t]
+\centering
+\resizebox{0.92\linewidth}{!}{\input{figs/body_classifier}}
+\caption{Classifying the cause from proxy telemetry. The victim symptom is identical for
+both mechanisms, but two proxy signals separate them, and each points to a different
+remedy.}
+\label{fig:classify}
+\end{figure}
+
+\paragraph{(4) Does it warn us early?} No. Comparing signal onset to victim-tail onset
+across trials, the signal moves essentially \emph{simultaneously} with the tail (within
+$\sim$1\,s, and if anything slightly after). Combined with the threshold shape, this
+rules out predictive control and points to a fast \emph{reactive} loop with hysteresis.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.72\linewidth]{figs/fig_detector.pdf}
+\caption{The proxy's worker busy-rate is a clean on/off detector of saturation: idle and
+loaded distributions do not overlap, so a single threshold separates them perfectly.}
+\label{fig:detector}
+\end{figure}
+
+The practical upshot is a controller design, not a predictor: \emph{detect saturation
+fast via a threshold on proxy busy-rate/throttling; react; use hysteresis to avoid
+flapping}.
+
+\section{A Reactive Connection-Rate Controller}
+\label{sec:mitigation}
+
+\begin{figure}[t]
+\centering
+\resizebox{\linewidth}{!}{\input{figs/body_controlloop}}
+\caption{System overview. The aggressor and victim share one node-level proxy. A
+userspace controller monitors the proxy's saturation signal (dashed) and, when the proxy
+is overloaded, caps the aggressor's new-connection rate (red); the victim and all other
+traffic are untouched. The proxy cannot be scaled out (one per node), so pacing the input
+is the available lever.}
+\label{fig:arch}
+\end{figure}
+
+Figure~\ref{fig:arch} shows the system. The remainder of this section explains the choice
+of control input (\S\ref{sec:mitigation}), the controller itself, and the result.
+
+\paragraph{Why connections, not bytes.} \S\ref{sec:char}--\ref{sec:signal} tell us the
+scarce resource is the proxy's capacity to \emph{establish} connections (each mutual-TLS
+handshake costs CPU; the bytes are negligible). So the input to control is the
+aggressor's \emph{new-connection rate}. We first confirm this is the right lever
+(Figure~\ref{fig:principle}): as we cap the aggressor's new-connection rate, there is a
+clean knee---once the cap drops below what the proxy can absorb, ztunnel stops throttling
+and the victim's tail collapses back to baseline. Capping connections un-saturates the
+proxy; nothing about bytes is involved.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.82\linewidth]{figs/fig_principle.pdf}
+\caption{Capping the aggressor's new-connection rate un-saturates the proxy. Below the
+knee ($\sim$800 conns/s here) ztunnel stops throttling (right axis) and the victim tail
+returns to baseline (left axis).}
+\label{fig:principle}
+\end{figure}
+
+\paragraph{The controller.} We build a small closed loop with two interchangeable
+enforcement backends. A userspace agent polls the proxy's saturation signal ($\sim$1\,s);
+when busy-rate crosses a high threshold it caps the aggressor's new-connection rate to a
+setpoint; it releases only after the proxy has stayed healthy for a dwell period. The
+\emph{policy} (detect $\to$ cap $\to$ dwell) is identical across backends; only the
+\emph{enforcement point} differs. We implement two: (i) a connection-layer token bucket
+on new-connection admission, which is what produces the closed-loop numbers in this
+section and \S\ref{sec:diff}; and (ii) an eBPF program that rate-limits connection-
+initiating (SYN) packets in the TC data path, which is the production-intended enforcer.
+We are explicit about which backend produced which number: the closed-loop
+victim-recovery results use backend (i); the $9\,$ns/packet cost in \S\ref{sec:diff} is a
+microbenchmark of backend (ii) in isolation. Because both enforce the same
+new-connection-rate cap, they are functionally equivalent for the victim-facing result;
+the remaining gap---attaching (ii) \emph{ahead of} Cilium's own data-path hook---is an
+integration detail we discuss in \S\ref{sec:setup-ebpf} and scope as engineering, not a
+difference in mechanism.
+
+\paragraph{A control subtlety worth naming.} Our first controller \emph{oscillated}. The
+reason is instructive: pacing \emph{works}, so as soon as it un-saturates the proxy the
+naive ``recovered $\rightarrow$ release'' rule immediately lifts the cap, the proxy
+re-saturates, and the cycle repeats every few seconds. The action erases the very signal
+that triggered it. The fix is standard once you see it---a dwell time plus a
+sustained-recovery requirement---after which the controller settles into a single clean
+pacing episode. This is a concrete instance of the general lesson that a controller acting
+on a self-suppressing signal must be hysteretic.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.62\linewidth]{figs/fig_mitigation.pdf}
+\caption{Closed-loop result ($n{=}12$ per bar, 95\% bootstrap CI). The controller reduces
+the victim's P99 from $47\,$ms to $3.7\,$ms---within 30\% of the interference-free
+baseline---while still serving the aggressor. The wide interval on the unmitigated bar
+reflects the intrinsic variance of proxy saturation, not measurement error.}
+\label{fig:mit}
+\end{figure}
+
+\paragraph{Result.} Figure~\ref{fig:mit} shows the outcome, over $n{=}12$ trials per
+condition with 95\% bootstrap confidence intervals. Unmitigated, the victim's P99 is
+$47.0\,$ms (95\% CI $[36.1, 56.6]$). With the controller enabled it is $3.72\,$ms (95\% CI
+$[3.64, 3.79]$)---a $12.7\times$ reduction that recovers 98\% of the interference gap and
+lands within 30\% of the no-aggressor baseline ($2.88\,$ms), while the aggressor still
+receives service at the setpoint (it is paced, not shut off). A Mann--Whitney $U$ test
+confirms the improvement is significant ($p{=}2.8\times10^{-5}$; we use a non-parametric
+test because the unmitigated distribution is not normal). The mitigated condition is
+tightly reproducible (CV $4\%$); the unmitigated condition is intrinsically noisy
+(CV $40\%$) because the proxy is pinned at its saturation cap and scheduling jitter
+dominates---a property of the phenomenon, not of measurement, and the reason the tail
+rather than the mean is the meaningful metric.
+
+\section{Implementation}
+\label{sec:impl}
+The system has three small components, all of which we release.
+
+\emph{Detector + control loop.} A userspace agent ($\approx$40 lines) polls the node-local
+ztunnel's saturation signal once per second---worker busy-rate from the Tokio runtime
+metrics endpoint, and CPU-throttling counts from the pod's cgroup---and drives a
+three-state machine (\textsc{open} $\to$ \textsc{paced} $\to$ \textsc{open}) with a high/low
+threshold band and a dwell timer. It emits the target new-connection rate as the only
+actuation output. Because ztunnel is distroless, the agent reads the cgroup counters from
+the node filesystem and scrapes the metrics port over the pod network, requiring no changes
+to ztunnel.
+
+\emph{Data-path enforcer.} The enforcer applies the target rate to the aggressor's
+new connections. We implement it two ways behind the same interface (\S\ref{sec:setup-ebpf}):
+(i) a connection-admission token bucket, used for all closed-loop experiments; and (ii) a
+$\approx$50-line eBPF program attached to the pod's virtual interface via TC that
+rate-limits connection-initiating (SYN) packets using a token bucket held in a BPF map the
+control loop updates; non-SYN packets take an early return. Both enforce the identical
+new-connection-rate policy.
+
+\emph{No mesh or application changes.} The design is external to both Istio and the
+application: it reads existing ztunnel telemetry and acts at the CNI/connection layer. It
+requires no modification to ztunnel, to the mesh control plane, or to any workload, which
+is what makes it deployable on an unmodified ambient-mode cluster.
+
+\section{Why Existing Mechanisms Do Not Address This}
+\label{sec:diff}
+\paragraph{Byte-pacing is blind to churn.} The closest existing mechanism is Cilium's
+Bandwidth Manager, which paces a pod's egress \emph{bytes} using the same kind of eBPF
+data-path machinery we use. If byte-pacing could solve this, our contribution would be
+redundant. It cannot. Figure~\ref{fig:diff} runs the same churn attack under three
+mitigations. At a $1\,$Mbit cap the victim tail is unchanged from unmitigated
+($56\,$ms). Even at an aggressive $256\,$kbit cap it only drops to a noisy $29\,$ms with
+the proxy still saturated---and such a cap would cripple any legitimate byte-heavy
+traffic from that pod. The reason is exactly the mismatch from \S\ref{sec:char}: churn is
+cheap on bytes ($\sim$1.25\,MB/s of tiny requests) but expensive on connections, so
+thousands of connections slip under any sane byte budget. Our connection-rate controller,
+on identical hardware and attack, restores the victim to $3.5\,$ms.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.78\linewidth]{figs/fig_differentiation.pdf}
+\caption{Same attack, three mitigations ($n{=}3$, $\pm$1 SD). Byte-rate pacing (Cilium
+Bandwidth Manager) barely helps because it controls the wrong quantity; pacing
+new-connection rate restores the victim.}
+\label{fig:diff}
+\end{figure}
+
+\paragraph{Autoscaling does not apply.} A natural response is to scale out. But
+ztunnel is a fixed one-per-node DaemonSet: there is no ``add more ztunnels'' knob, so the
+usual horizontal escape hatch simply does not exist for the shared proxy. Scaling the
+\emph{victim's} application also does not help, because the victim's app is not the
+bottleneck (its CPU is idle; \S\ref{sec:char}). And even where autoscaling could act, its
+seconds-scale reaction time cannot catch a saturation onset that, as \S\ref{sec:char}
+showed, is effectively instantaneous.
+
+\section{Overhead and Sensitivity}
+\label{sec:overhead}
+The mitigation is inexpensive and safe to leave enabled.
+The data-path cost is dominated by the eBPF enforcer, which we microbenchmark in
+isolation at $9\,$ns per packet (mean over $10^6$ iterations) and which runs \emph{only}
+on connection-initiating (SYN) packets---steady data traffic hits an early return and is
+untouched. We report this as the per-packet cost of the enforcement primitive, not as an
+end-to-end overhead measurement; the userspace control loop adds one metric scrape and a
+map write per second, which is negligible and off the data path. When the proxy is
+healthy the controller holds the cap open, so the \emph{whole system} is a measured
+no-op: with the controller running but no aggressor, victim P99 ($2.9\,$ms) is
+statistically identical to having no controller at all---this end-to-end no-op result
+uses the same connection-layer backend as our headline numbers, so it reflects the
+deployed cost, not just the microbenchmark. The setpoint is forgiving rather than a knife-edge (Figure~\ref{fig:sens})---the
+victim stays protected ($<4.5\,$ms) across a $6\times$ range of connection-rate caps
+(200--1200 conns/s), degrading gracefully as the cap approaches the proxy's knee. And on
+controller failure the last cap persists (fail-safe direction) rather than reverting to
+unlimited.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.78\linewidth]{figs/fig_sensitivity.pdf}
+\caption{The controller's setpoint is forgiving: the victim stays well-protected across a
+$6\times$ range of connection-rate caps (shaded), rather than depending on a precisely
+tuned value.}
+\label{fig:sens}
+\end{figure}
+
+\section{Threat Model and Robustness}
+\label{sec:threat}
+We separate what our design defends against today from where an informed adversary could
+push, since ``noisy neighbor'' spans both accidental and adversarial workloads.
+
+\paragraph{What we defend against.} A co-located tenant---malicious or merely
+misconfigured---that saturates the node's shared proxy by opening connections faster than
+the proxy can service them. This is the common accidental case (a client library with
+aggressive reconnection, short keep-alive, or per-request TLS) and the simplest
+deliberate one. Our controller detects the resulting proxy saturation and paces the
+offending source's new-connection rate back below the knee.
+
+\paragraph{Evasion 1: staying just under the threshold.} An adversary who knows the
+detector could try to hover just below the saturation point. This is self-limiting by
+construction: the threshold is the proxy's saturation knee, so ``just under'' is, by
+definition, the regime where the victim is \emph{not} harmed (Figure~\ref{fig:principle}
+shows the victim is at baseline for any load the proxy can absorb). The adversary cannot
+both stay below the knee and hurt the neighbor---the knee is exactly where harm begins.
+The residual risk is threshold \emph{tuning}: set too high, a slow ramp could inflict some
+tail before tripping; our hysteretic design trips at the first saturation sample
+($\sim$1\,s), and an adaptive setpoint (below) tightens this further.
+
+\paragraph{Evasion 2: spreading churn across many source IPs.} A stronger adversary could
+churn connections from many pods/IPs so that no single source looks abusive. This is a
+real limitation of a purely per-source cap and we do not claim to solve it here. Two
+things bound it. First, the \emph{detection} signal is source-agnostic---it is the
+proxy's own saturation---so the system still \emph{knows} it is under attack even when no
+single source stands out; what degrades is the \emph{attribution} needed to pace fairly.
+Second, the natural extension is to pace against the proxy's total connection-admission
+budget and divide it fairly across active sources (a weighted fair share, \S\ref{sec:disc}),
+which caps aggregate churn regardless of how many identities it is spread over. We
+evaluate the single-source case here and scope multi-source fair-sharing as the primary
+piece of future work.
+
+\paragraph{Multi-tenant reality.} Production nodes host many pods, not one victim and one
+aggressor. Our detection generalizes unchanged (the signal is the shared proxy's state),
+but the actuation policy must move from ``cap the aggressor'' to ``allocate the proxy's
+connection budget across sources.'' We sketch this in \S\ref{sec:disc} but do not yet
+evaluate it; it is the most important open item for a deployment.
+
+\section{Discussion, Limitations, and Future Work}
+\label{sec:disc}
+\paragraph{The general lesson.} The recurring theme is a resource--control mismatch.
+Shared-dataplane designs concentrate a new scarce resource---proxy connection-handling
+capacity---in a component that (a) no application owns, (b) cannot be scaled out, and
+(c) is invisible to byte- and CPU-based tools. The fix is not clever; it is just aimed at
+the right target: measure the scarce resource where it is scarce (the proxy), and control
+the input that consumes it (new connections). We expect the same recipe to apply to other
+shared-dataplane proxies.
+
+\paragraph{Honest limitations.} We group these by what closes them.
+\emph{(Statistical.)} The headline mitigation result is over $n{=}12$ trials with 95\%
+bootstrap CIs and a significance test (\S\ref{sec:mitigation}). The differentiation
+(\S\ref{sec:diff}) and sensitivity (\S\ref{sec:overhead}) experiments remain smaller
+($n{=}3$ and $n{=}1$--$3$ per point); because latency is heavy-tailed, a camera-ready
+should bring these to the same $n{=}12$ standard and lengthen the graceful-degradation
+soak. The effect sizes there are large enough (byte-pacing does not move the tail at all;
+the setpoint is protective across a $6\times$ range) that we expect the conclusions to
+hold, but we report them as the less-powered results they are.
+\emph{(Integration.)} The eBPF enforcer is microbenchmarked, not yet wired ahead of
+Cilium's tcx hook (\S\ref{sec:setup-ebpf}); the closed-loop numbers use the equivalent
+connection-admission backend, and finishing the in-CNI attach is engineering, not new
+mechanism.
+\emph{(Generality.)} We characterized one victim endpoint, one benchmark
+(DeathStarBench Social Network), and one mesh (Istio ambient). We argue the mechanism
+(connection-setup cost) is transport-agnostic, but this is currently reasoning, not
+measurement: the L7 waypoint proxy, a second (e.g., gRPC) workload, and another
+shared-dataplane mesh are untested and are the clearest way to substantiate the generality
+claim. \emph{(Multi-tenant \& adversarial.)} Covered in \S\ref{sec:threat}: single-source
+today; source-agnostic \emph{detection} already generalizes, but fair \emph{actuation}
+across many simultaneous churn sources is the primary open problem.
+
+\paragraph{Adaptivity.} Our controller uses a fixed setpoint chosen from the measured
+knee. A production version should learn it online---tighten the cap until throttling
+stops, then hold just below the knee---and split capacity fairly when several sources
+contend. The mechanism classifier (\S\ref{sec:signal}) also suggests routing: apply
+connection pacing when throttling indicates a proxy problem, and escalate to
+backend/app remediation when the fingerprint indicates the other cause.
+
+\section{Related Work}
+\paragraph{Overload control and admission control.} Breakwater and DAGOR protect a server
+under load, and Aequitas does admission control for datacenter RPCs. All three act by
+\emph{dropping or deferring requests}, keyed off queueing delay or per-RPC latency, at the
+RPC or transport layer. They are the right conceptual comparison, and two points relate
+them to our setting. First, their \emph{signal} is request-level congestion at an
+endpoint the application controls; ours is compute saturation of a \emph{shared network
+proxy} that no application owns and that request-level metrics do not observe (in our
+backend-contention case the proxy is busy holding tasks; in the churn case the cost is in
+connection setup, not request queueing). Second, their \emph{lever} is request
+admission---which, adapted to our problem, is essentially per-connection admission at the
+proxy, i.e., a proxy-resident fair queue over connections. That is a legitimate
+alternative enforcement point to our CNI-layer pacing, and comparing CNI-layer connection
+pacing against a proxy-resident connection fair-share (a ztunnel-internal Breakwater-style
+admission controller) is the baseline we most want to add next; it needs modifying ztunnel
+itself, which is why it is future rather than present work. The key distinction is not
+pace-vs-drop alone but \emph{where the scarce resource is and what signal exposes it}:
+we show the shared-proxy connection-handling bottleneck is invisible to the byte- and
+request-level signals these systems use.
+
+\paragraph{Pacing mechanism and CNI QoS.} EDT-based pacing itself is not new---it is the
+mechanism behind Carousel and Cilium's Bandwidth Manager---but those pace \emph{bytes}
+from static per-pod limits; our contribution is closing a loop from proxy saturation onto
+\emph{connection-rate} pacing, and showing empirically (\S\ref{sec:diff}) that the
+byte-rate incumbent cannot address connection-churn interference. Interference-aware
+schedulers reduce co-location contention by managing CPU allocation; we act in the network
+data path on a resource (proxy connection handling) that scheduling does not govern.
+
+\paragraph{Positioning.} To our knowledge this is the first measurement and mitigation of
+connection-churn interference through a shared ambient-mesh proxy. Our novelty is not a new
+pacing primitive but the diagnosis (what is scarce, what signal exposes it) and the
+matching closed loop.
+
+\section{Conclusion}
+Sharing a proxy to save resources creates a shared point of failure whose scarce
+resource---connection handling---is invisible to the tools operators already run. We
+measured this effect on a real microservice benchmark, separated it from a look-alike
+backend-contention cause, showed that the proxy's own telemetry detects and classifies it
+almost perfectly (though it neither predicts severity nor warns early), and built a small
+reactive controller that restores victim tail latency $12.7\times$ where byte-rate pacing
+cannot. The fix is simple once the diagnosis is right: watch the resource that is truly
+scarce, and pace the input that consumes it.
+
+\end{document}

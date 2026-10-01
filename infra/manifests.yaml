@@ -1,0 +1,110 @@
+# Reusable pod/deployment specs for the SSP ambient-mesh testbed.
+# These are the driver/aggressor/probe pods that are NOT part of the DSB helm chart and were
+# originally created via inline heredocs. Consolidated here for recovery (see SETUP_RECOVERY.md).
+# Apply AFTER: cluster + Cilium + Istio ambient + DSB helm + node labels (ssp-role) exist.
+#   kubectl apply -f manifests.yaml
+# Then rebuild in-pod binaries (wrk2, churngen) per SETUP_RECOVERY.md §3b — images are bare debian.
+# NOTE: agg-echo goes in ambient ns 'dsb'; loadgen is a SEPARATE non-mesh ns; nodeprobe/bpfbuilder
+# are privileged host-access pods in kube-system.
+---
+# Disjoint aggressor TARGET (shares ONLY ztunnel with victim; zero app-backend overlap).
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: agg-echo, namespace: dsb, labels: {app: agg-echo}}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: agg-echo}}
+  template:
+    metadata: {labels: {app: agg-echo}}
+    spec:
+      nodeSelector: {ssp-role: under-test}
+      containers:
+      - name: echo
+        image: hashicorp/http-echo:1.0
+        args: ["-text=agg","-listen=:5678"]
+        ports: [{containerPort: 5678}]
+        resources: {requests: {cpu: "100m", memory: "64Mi"}, limits: {cpu: "2", memory: "256Mi"}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: agg-echo, namespace: dsb}
+spec:
+  selector: {app: agg-echo}
+  ports: [{port: 8080, targetPort: 5678}]
+---
+# CHURN aggressor SOURCE (meshed, on under-test node → its new connections are real mTLS
+# handshakes through the shared ztunnel). Rebuild /tmp/churngen[_ctl] here (go build; sources
+# in infra/p3_*.sh, p4_diff.sh). For the BWM comparison (Phase 4) add annotation:
+#   kubernetes.io/egress-bandwidth: "256k"   (recreate pod to change the cap)
+apiVersion: v1
+kind: Pod
+metadata: {name: churn, namespace: dsb, labels: {app: churn}}
+spec:
+  nodeSelector: {ssp-role: under-test}
+  containers:
+  - name: c
+    image: debian:12
+    command: ["sleep","infinity"]
+    resources: {requests: {cpu: "2", memory: "1Gi"}, limits: {cpu: "6", memory: "2Gi"}}
+---
+# LOADGEN (victim traffic source). SEPARATE ns, NOT ambient (external client). node=loadgen.
+# Install wrk2 + python3/aiohttp; copy DSB scripts+dataset; patch lua to relative paths.
+apiVersion: v1
+kind: Namespace
+metadata: {name: loadgen}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: loadgen, namespace: loadgen, labels: {app: loadgen}}
+spec:
+  nodeSelector: {ssp-role: loadgen}
+  containers:
+  - name: tools
+    image: debian:12
+    command: ["sleep","infinity"]
+    resources: {requests: {cpu: "2", memory: "2Gi"}, limits: {cpu: "6", memory: "4Gi"}}
+---
+# NODEPROBE — reads host /proc + cgroup (metrics-server/kubectl-top is broken on Cilium overlay).
+# Provides node CPU% and ztunnel cgroup cpu.stat (usage_usec / nr_throttled / throttled_usec).
+apiVersion: v1
+kind: Pod
+metadata: {name: nodeprobe, namespace: kube-system, labels: {app: nodeprobe}}
+spec:
+  nodeSelector: {ssp-role: under-test}
+  hostPID: true
+  hostNetwork: true
+  tolerations: [{operator: Exists}]
+  containers:
+  - name: p
+    image: debian:12
+    command: ["sleep","infinity"]
+    securityContext: {privileged: true}
+    volumeMounts:
+    - {name: proc, mountPath: /host/proc}
+    - {name: cg, mountPath: /host/sys/fs/cgroup}
+  volumes:
+  - {name: proc, hostPath: {path: /proc}}
+  - {name: cg, hostPath: {path: /sys/fs/cgroup}}
+---
+# BPFBUILDER — privileged, host netns; compiles + loads the TC eBPF SYN-limiter (synlimit.bpf.c).
+# Install: clang llvm libbpf-dev linux-libc-dev gcc iproute2 make + bpftool
+# (use /usr/lib/linux-tools-*/bpftool binary directly; the wrapper version-checks the host kernel).
+apiVersion: v1
+kind: Pod
+metadata: {name: bpfbuilder, namespace: kube-system, labels: {app: bpfbuilder}}
+spec:
+  nodeSelector: {ssp-role: under-test}
+  hostNetwork: true
+  hostPID: true
+  tolerations: [{operator: Exists}]
+  containers:
+  - name: b
+    image: ubuntu:24.04
+    command: ["sleep","infinity"]
+    securityContext: {privileged: true}
+    volumeMounts:
+    - {name: bpf, mountPath: /sys/fs/bpf, mountPropagation: Bidirectional}
+    - {name: cg, mountPath: /sys/fs/cgroup}
+  volumes:
+  - {name: bpf, hostPath: {path: /sys/fs/bpf, type: DirectoryOrCreate}}
+  - {name: cg, hostPath: {path: /sys/fs/cgroup}}

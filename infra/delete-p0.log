@@ -1,0 +1,21 @@
+2026-09-18 21:26:40 [ℹ]  deleting EKS cluster "ssp-p0"
+2026-09-18 21:26:40 [ℹ]  will drain 0 unmanaged nodegroup(s) in cluster "ssp-p0"
+2026-09-18 21:26:40 [ℹ]  starting parallel draining, max in-flight of 1
+2026-09-18 21:26:40 [ℹ]  deleted 0 Fargate profile(s)
+2026-09-18 21:26:41 [✔]  kubeconfig has been updated
+2026-09-18 21:26:41 [ℹ]  cleaning up AWS load balancers created by Kubernetes objects of Kind Service, Ingress, or Gateway
+2026-09-18 21:26:41 [ℹ]  
+4 sequential tasks: { delete nodegroup "ng-p0", delete IAM OIDC provider, delete addon IAM "eksctl-ssp-p0-addon-vpc-cni", delete cluster control plane "ssp-p0" [async] 
+}
+2026-09-18 21:26:41 [ℹ]  will delete stack "eksctl-ssp-p0-nodegroup-ng-p0"
+2026-09-18 21:26:41 [ℹ]  waiting for stack "eksctl-ssp-p0-nodegroup-ng-p0" to get deleted
+2026-09-18 21:26:41 [ℹ]  waiting for CloudFormation stack "eksctl-ssp-p0-nodegroup-ng-p0"
+2026-09-18 21:27:12 [ℹ]  waiting for CloudFormation stack "eksctl-ssp-p0-nodegroup-ng-p0"
+2026-09-18 21:27:52 [ℹ]  waiting for CloudFormation stack "eksctl-ssp-p0-nodegroup-ng-p0"
+2026-09-18 21:29:23 [ℹ]  waiting for CloudFormation stack "eksctl-ssp-p0-nodegroup-ng-p0"
+2026-09-18 21:31:00 [ℹ]  waiting for CloudFormation stack "eksctl-ssp-p0-nodegroup-ng-p0"
+2026-09-18 21:31:56 [ℹ]  waiting for CloudFormation stack "eksctl-ssp-p0-nodegroup-ng-p0"
+2026-09-18 21:31:56 [ℹ]  will delete stack "eksctl-ssp-p0-addon-vpc-cni"
+2026-09-18 21:31:57 [ℹ]  will delete stack "eksctl-ssp-p0-cluster"
+2026-09-18 21:31:57 [✔]  all cluster resources were deleted
+DELETE_EXIT=0

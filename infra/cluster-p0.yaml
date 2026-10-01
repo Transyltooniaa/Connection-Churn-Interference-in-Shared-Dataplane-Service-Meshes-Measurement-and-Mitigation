@@ -1,0 +1,40 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: ssp-p0
+  region: us-east-2
+  version: "1.33"          # verified: only version inside Istio-1.31 + Cilium-1.20 support
+
+iam:
+  withOIDC: true
+
+# Cilium 1.20 will REPLACE the VPC CNI. Nodes carry the cilium not-ready taint so nothing
+# schedules until Cilium is installed. We keep kube-proxy (lower-disruption path for ambient).
+managedNodeGroups:
+  - name: ng-p0
+    instanceType: c6i.2xlarge   # 8 vCPU / 16 GB, non-burstable (reproducible latency)
+    desiredCapacity: 2
+    minSize: 0
+    maxSize: 2
+    volumeSize: 40
+    disableIMDSv1: true
+    taints:
+      - key: "node.cilium.io/agent-not-ready"
+        value: "true"
+        effect: "NoExecute"
+    labels:
+      role: p0
+    tags:
+      project: ssp-ambient-mesh
+      phase: p0-feasibility-gate
+
+# Do NOT preinstall the VPC CNI addon as default networking — Cilium takes over.
+addons:
+  - name: kube-proxy
+  - name: coredns
+# (vpc-cni intentionally omitted / will be neutralized: aws-node patched to not schedule)
+
+cloudWatch:
+  clusterLogging:
+    enableTypes: []
