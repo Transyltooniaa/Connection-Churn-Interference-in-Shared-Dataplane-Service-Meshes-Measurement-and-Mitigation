@@ -1,0 +1,206 @@
+---
+# ============================================================
+# NATS JetStream Leaf Node — Node-Local Message Broker DaemonSet
+# ============================================================
+# One isolated, non-clustered NATS JetStream instance per host node.
+# Each node-local instance maintains its own JetStream domain
+# (domain = hostname) so subjects never bleed across nodes.
+# Memory + disk quotas are enforced per stream; broker runs inside
+# a dedicated cgroup cage (500m CPU / 512Mi RAM hard limits).
+#
+# Per-service streams (subjects) are created at runtime by the
+# Multi-Ingress Ingestion Proxy on startup. KEDA scrapes the
+# per-subject consumer-lag from the monitoring port (8222).
+#
+# Apply AFTER: Cilium + Istio ambient + node labels (ssp-role) exist.
+#   kubectl apply -f nats-jetstream-daemonset.yaml
+# ============================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nats-system
+  labels:
+    istio.io/dataplane-mode: none   # exclude broker from ambient mesh
+---
+# ── ConfigMap ────────────────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nats-node-config
+  namespace: nats-system
+data:
+  nats.conf: |
+    # Non-clustered, node-local leaf node config.
+    # PORT: internal clients (ingestion proxy + worker pods)
+    port: 4222
+    # MONITORING: KEDA scrapes /jsz?streams=true&consumers=true&offset=0
+    http_port: 8222
+
+    # JetStream: node-local domain keeps subject namespace isolated.
+    # Storage dir is tmpfs-backed for pure-memory semantics with
+    # graceful restart persistence (kernel page-cache only).
+    jetstream {
+      domain: "node-local"
+      store_dir: "/data/jetstream"
+      # Hard cap on total JetStream memory: 256Mi per node instance.
+      # Individual stream quotas (max_bytes) are set at stream creation.
+      max_memory_store: 268435456   # 256 MiB
+      max_file_store:   536870912   # 512 MiB fallback (disk)
+    }
+
+    # Logging (match existing infra verbosity — minimal, no debug/trace)
+    logtime: true
+    log_size_limit: 10485760   # 10 MiB rolling
+
+    # Disable clustering / routes / leafnodes at the DaemonSet layer.
+    # Each host node is fully self-contained.
+    accounts {
+      $G {
+        users: [ { user: "nats", password: "nats-local" } ]
+        jetstream: enabled
+      }
+    }
+---
+# ── DaemonSet ────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nats-jetstream
+  namespace: nats-system
+  labels:
+    app: nats-jetstream
+    component: message-broker
+spec:
+  selector:
+    matchLabels:
+      app: nats-jetstream
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: nats-jetstream
+        component: message-broker
+      annotations:
+        # Expose JetStream metrics endpoint for KEDA scraping (port 8222).
+        prometheus.io/scrape: "false"   # KEDA uses raw HTTP /jsz, not prom
+    spec:
+      # ── Scheduling: under-test nodes only ────────────────
+      nodeSelector:
+        ssp-role: under-test
+      tolerations:
+        - operator: Exists
+
+      # ── Graceful shutdown: let in-flight acks drain ──────
+      terminationGracePeriodSeconds: 30
+
+      # ── Security: dedicated service account (no RBAC needed) ─
+      serviceAccountName: nats-jetstream
+      automountServiceAccountToken: false
+
+      # ── Host networking: loopback ports reachable on 127.0.0.1 ─
+      # Required so ingestion proxy (also in host-net) can reach
+      # 127.0.0.1:4222 without any overlay hop.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+
+      containers:
+        - name: nats
+          image: nats:2.10-alpine
+          args:
+            - "-c"
+            - "/etc/nats/nats.conf"
+          ports:
+            - name: client
+              containerPort: 4222
+              protocol: TCP
+              hostPort: 4222       # loopback-bound; only intra-node traffic
+            - name: monitor
+              containerPort: 8222
+              protocol: TCP
+              hostPort: 8222
+          env:
+            # Expose pod/node identity for structured logs
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+
+          # ── cgroup cage (hard limits) ─────────────────────
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"         # prevents broker loop starving workload pods
+              memory: "512Mi"     # OOM-safe ceiling; JetStream soft caps above
+
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nats
+            - name: jetstream-data
+              mountPath: /data/jetstream
+
+          # ── Health probes ─────────────────────────────────
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8222
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8222
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 5
+
+      volumes:
+        - name: config
+          configMap:
+            name: nats-node-config
+        # tmpfs: pure-memory storage that vanishes on pod restart;
+        # keeps JetStream semantics ephemeral (no stale backlog after restart).
+        - name: jetstream-data
+          emptyDir:
+            medium: Memory
+            sizeLimit: 512Mi
+---
+# ── ServiceAccount ───────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nats-jetstream
+  namespace: nats-system
+---
+# ── Headless Service (intra-node KEDA scrape target) ─────────
+# KEDA ScaledObject references the pod IP (status.hostIP) directly;
+# this Service is kept for kubectl tooling convenience only.
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats-jetstream
+  namespace: nats-system
+  labels:
+    app: nats-jetstream
+spec:
+  selector:
+    app: nats-jetstream
+  clusterIP: None     # headless — one DNS A-record per pod
+  ports:
+    - name: client
+      port: 4222
+      targetPort: 4222
+      protocol: TCP
+    - name: monitor
+      port: 8222
+      targetPort: 8222
+      protocol: TCP

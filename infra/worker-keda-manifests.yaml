@@ -1,0 +1,408 @@
+---
+# ============================================================
+# Pull-Based Worker Pods + KEDA Autoscaler
+# ============================================================
+# This manifest contains:
+#   1. Worker Deployment — long-polling NATS Fetch(1) consumer pods.
+#      Scaled from 0 by KEDA based on queue lag. Pinned to their
+#      originating node via TopologySpreadConstraints.
+#   2. KEDA ScaledObject — drives HPA from NATS JetStream consumer lag.
+#   3. Virtual Endpoints — redirect standard K8s Service traffic to the
+#      local loopback ingestion proxy ports (xDS-compliant trick).
+#   4. AuthorizationPolicy placeholder — consumers identified by SA.
+#
+# Prerequisites:
+#   - KEDA installed in the cluster (helm install keda keda-charts/keda)
+#   - NATS JetStream DaemonSet running (nats-jetstream-daemonset.yaml)
+#   - Ingestion Proxy DaemonSet running (ingestion-proxy-daemonset.yaml)
+#
+# Apply:
+#   kubectl apply -f worker-keda-manifests.yaml
+# ============================================================
+
+# ─────────────────────────────────────────────────────────────
+# Section 1: Worker Deployment — Service Alpha
+# ─────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-alpha
+  namespace: dsb
+  labels:
+    app: worker-alpha
+    ssp-component: pull-worker
+spec:
+  # Start at 0 — KEDA will scale up when queue lag > 0.
+  replicas: 0
+  selector:
+    matchLabels:
+      app: worker-alpha
+  template:
+    metadata:
+      labels:
+        app: worker-alpha
+        ssp-component: pull-worker
+    spec:
+      # ── Placement: must land on the same node where the queue lives ──
+      # TopologySpreadConstraint ensures KEDA-spawned replicas always
+      # schedule onto the specific node experiencing the backlog.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: worker-alpha
+      nodeSelector:
+        ssp-role: under-test
+
+      # ── Graceful shutdown: ACK current message before SIGTERM kills container ─
+      # Must be longer than the application's message-processing SLA.
+      terminationGracePeriodSeconds: 60
+
+      serviceAccountName: worker-alpha
+
+      containers:
+        - name: worker
+          # Replace with your actual worker image.
+          # The image must implement a NATS JetStream long-polling loop:
+          #   js.subscribe("local.tasks.alpha", { queue: "workers-alpha",
+          #                                        maxMessages: 1,
+          #                                        wait: 20s })
+          # Reference implementation in infra/worker/ (see worker/README.md).
+          image: worker-alpha:latest
+          imagePullPolicy: IfNotPresent
+
+          env:
+            - name: NATS_URL
+              value: "nats://127.0.0.1:4222"
+            - name: NATS_USER
+              value: "nats"
+            - name: NATS_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: nats-credentials
+                  namespace: ingestion-proxy
+                  key: NATS_PASS
+            - name: NATS_SUBJECT
+              value: "local.tasks.alpha"
+            - name: NATS_QUEUE_GROUP
+              value: "workers-alpha"
+            # Long-poll wait: prevent idle thrashing on empty queue.
+            - name: NATS_FETCH_WAIT_SECONDS
+              value: "20"
+            # Bind to the local host IP so NATS consumer registration
+            # is correctly attributed to this node's broker instance.
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "128Mi"
+            limits:
+              cpu: "2"
+              memory: "512Mi"
+
+          # No listening ports — workers pull, they never accept connections.
+          # Liveness: ensure the pull loop is alive (process-level).
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pgrep -f worker > /dev/null"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+---
+# ── ServiceAccount + RBAC for worker-alpha ───────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: worker-alpha
+  namespace: dsb
+automountServiceAccountToken: false
+---
+# ─────────────────────────────────────────────────────────────
+# Section 2: Worker Deployment — Service Beta
+# ─────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker-beta
+  namespace: dsb
+  labels:
+    app: worker-beta
+    ssp-component: pull-worker
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: worker-beta
+  template:
+    metadata:
+      labels:
+        app: worker-beta
+        ssp-component: pull-worker
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: worker-beta
+      nodeSelector:
+        ssp-role: under-test
+      terminationGracePeriodSeconds: 60
+      serviceAccountName: worker-beta
+      containers:
+        - name: worker
+          image: worker-beta:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: NATS_URL
+              value: "nats://127.0.0.1:4222"
+            - name: NATS_USER
+              value: "nats"
+            - name: NATS_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: nats-credentials
+                  namespace: ingestion-proxy
+                  key: NATS_PASS
+            - name: NATS_SUBJECT
+              value: "local.tasks.beta"
+            - name: NATS_QUEUE_GROUP
+              value: "workers-beta"
+            - name: NATS_FETCH_WAIT_SECONDS
+              value: "20"
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "128Mi"
+            limits:
+              cpu: "2"
+              memory: "512Mi"
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "-c", "pgrep -f worker > /dev/null"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: worker-beta
+  namespace: dsb
+automountServiceAccountToken: false
+---
+# ─────────────────────────────────────────────────────────────
+# Section 3: KEDA ScaledObject — Service Alpha
+# ─────────────────────────────────────────────────────────────
+# KEDA reads NATS JetStream consumer lag from the node-local
+# monitoring endpoint (port 8222) and drives an HPA on worker-alpha.
+#
+# Formula (from design spec):
+#   targetPods = ceil(TotalQueueLag / targetLagPerPod)
+#
+# The NATS scaler polls /jsz?streams=true&consumers=true and extracts
+# the lag for consumer group "workers-alpha" on stream "LOCAL-ALPHA".
+#
+# IMPORTANT: serverAddress must be the host IP of the node running the
+# NATS DaemonSet pod. At runtime this is injected via the KEDA trigger
+# authentication or via a node-specific ScaledObject per node.
+# For a single under-test node testbed, hardcode the node IP here.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: keda-alpha
+  namespace: dsb
+spec:
+  scaleTargetRef:
+    name: worker-alpha
+  # Scale to 0 when queue is empty (scale-to-zero enabled by default in KEDA).
+  minReplicaCount: 0
+  maxReplicaCount: 20
+  # Stabilisation: wait 300s of empty queue before scaling to 0.
+  # Prevents pod flapping during traffic lulls.
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Pods
+              value: 4
+              periodSeconds: 15
+  triggers:
+    - type: nats-jetstream
+      metadata:
+        # The node-local NATS monitoring endpoint.
+        # Replace with the actual under-test node IP or use a per-node
+        # ScaledObject pattern with KEDA TriggerAuthentication.
+        natsServerMonitoringEndpoint: "http://192.168.11.9:8222"
+        # JetStream stream and consumer identifiers.
+        streamName: "LOCAL-ALPHA"
+        consumerName: "workers-alpha"
+        # lagThreshold: messages per pod target (ceil(lag/threshold) = target pods)
+        lagThreshold: "50"
+        # activationLagThreshold: minimum lag before KEDA activates scaling at all.
+        activationLagThreshold: "1"
+---
+# ─────────────────────────────────────────────────────────────
+# Section 4: KEDA ScaledObject — Service Beta
+# ─────────────────────────────────────────────────────────────
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: keda-beta
+  namespace: dsb
+spec:
+  scaleTargetRef:
+    name: worker-beta
+  minReplicaCount: 0
+  maxReplicaCount: 20
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Pods
+              value: 4
+              periodSeconds: 15
+  triggers:
+    - type: nats-jetstream
+      metadata:
+        natsServerMonitoringEndpoint: "http://192.168.11.9:8222"
+        streamName: "LOCAL-BETA"
+        consumerName: "workers-beta"
+        lagThreshold: "50"
+        activationLagThreshold: "1"
+---
+# ─────────────────────────────────────────────────────────────
+# Section 5: Virtual Endpoints Redirection
+# ─────────────────────────────────────────────────────────────
+# Standard Kubernetes Service for Service Alpha — mesh sees a normal
+# ClusterIP service, preserving xDS/SPIFFE identity for ztunnel AuthPol.
+# But the Endpoints object points to 127.0.0.1:{ingestion port} so that
+# all outbound traffic routed by ztunnel arrives at the proxy loopback.
+#
+# NOTE: 127.0.0.1 is only reachable from within the same host network
+# namespace (hostNetwork=true pods / ztunnel). This is intentional.
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-alpha
+  namespace: dsb
+  labels:
+    app: svc-alpha
+    ssp-component: virtual-endpoint
+spec:
+  # No selector — we manage the Endpoints manually below.
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 10001
+      protocol: TCP
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: svc-alpha
+  namespace: dsb
+subsets:
+  - addresses:
+      # 127.0.0.1 — routes to the ingestion proxy loopback listener.
+      # Replace with the actual under-test node IP if hostNetwork-to-pod
+      # routing requires a routable address rather than loopback.
+      - ip: "127.0.0.1"
+    ports:
+      - name: http
+        port: 10001
+        protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-beta
+  namespace: dsb
+  labels:
+    app: svc-beta
+    ssp-component: virtual-endpoint
+spec:
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 10002
+      protocol: TCP
+---
+apiVersion: v1
+kind: Endpoints
+metadata:
+  name: svc-beta
+  namespace: dsb
+subsets:
+  - addresses:
+      - ip: "127.0.0.1"
+    ports:
+      - name: http
+        port: 10002
+        protocol: TCP
+---
+# ─────────────────────────────────────────────────────────────
+# Section 6: Istio AuthorizationPolicy (L4 — enforced by ztunnel)
+# ─────────────────────────────────────────────────────────────
+# Only the ingestion proxy (SA: ingestion-proxy/ingestion-proxy) may
+# receive traffic destined for the svc-alpha / svc-beta local endpoints.
+# Worker pods (SA: dsb/worker-alpha etc.) connect OUTBOUND to NATS; they
+# do not receive inbound connections and need no ingress AuthPol.
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-ingestion-proxy-alpha
+  namespace: dsb
+spec:
+  selector:
+    matchLabels:
+      app: svc-alpha
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/ingestion-proxy/sa/ingestion-proxy"
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-ingestion-proxy-beta
+  namespace: dsb
+spec:
+  selector:
+    matchLabels:
+      app: svc-beta
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/ingestion-proxy/sa/ingestion-proxy"

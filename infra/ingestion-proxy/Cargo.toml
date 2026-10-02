@@ -1,0 +1,32 @@
+[package]
+name = "ingestion-proxy"
+version = "0.1.0"
+edition = "2021"
+description = "Node-local Multi-Ingress Ingestion Proxy — async Rust DaemonSet component"
+
+[[bin]]
+name = "ingestion-proxy"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio          = { version = "1",  features = ["full"] }
+# NATS 2.x async client with JetStream support
+async-nats     = "0.35"
+# Structured logging (matches existing infra: timestamps, level, target)
+tracing        = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"] }
+# Config from env-vars (no file-based config: DaemonSet mounts env via ConfigMap)
+serde          = { version = "1", features = ["derive"] }
+envy           = "0.4"
+# Error handling
+anyhow         = "1"
+# Byte serialisation (length-prefixed framing over the loopback TCP stream)
+bytes          = "1"
+tokio-util     = { version = "0.7", features = ["codec"] }
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = "symbols"

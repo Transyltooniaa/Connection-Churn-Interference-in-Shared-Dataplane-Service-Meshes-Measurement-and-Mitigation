@@ -1,0 +1,186 @@
+---
+# ============================================================
+# Multi-Ingress Ingestion Proxy — DaemonSet
+# ============================================================
+# Rust-based async daemon that bridges ztunnel's decrypted TCP
+# streams to the node-local NATS JetStream broker.
+#
+# One DaemonSet pod per node; each pod opens one loopback TCP
+# listener per registered service (SERVICES env var).
+# Connections are terminated instantly after the broker write;
+# no persistent state is kept inside this process.
+#
+# Prerequisites:
+#   - nats-jetstream DaemonSet is running on the same node
+#   - Container image pushed to your registry (IMAGE env below)
+#
+# Apply:
+#   kubectl apply -f ingestion-proxy-daemonset.yaml
+# ============================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ingestion-proxy
+  labels:
+    istio.io/dataplane-mode: none   # proxy itself is NOT in the ambient mesh
+---
+# ── ConfigMap: per-cluster service port map ──────────────────
+# Edit SERVICES to match the services co-located on under-test nodes.
+# Format: comma-separated name:port pairs.
+# Each port is the loopback port ztunnel is configured to forward to
+# (static mapping must match your Istio ServiceEntry / Endpoints override).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ingestion-proxy-config
+  namespace: ingestion-proxy
+data:
+  NATS_URL: "nats://127.0.0.1:4222"
+  NATS_USER: "nats"
+  SERVICES: "alpha:10001,beta:10002"
+  STREAM_MAX_BYTES: "134217728"   # 128 MiB per-stream hard cap
+  BACKLOG_LIMIT: "10000"          # MaxMsgs before DiscardNew activates
+  MAX_PAYLOAD_BYTES: "1048576"    # 1 MiB max read per TCP connection
+  RUST_LOG: "ingestion_proxy=info,warn"
+---
+# ── Secret: NATS credentials (reference from env below) ──────
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nats-credentials
+  namespace: ingestion-proxy
+type: Opaque
+stringData:
+  NATS_PASS: "nats-local"   # Must match NATS server config password
+---
+# ── ServiceAccount ───────────────────────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ingestion-proxy
+  namespace: ingestion-proxy
+automountServiceAccountToken: false
+---
+# ── DaemonSet ────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ingestion-proxy
+  namespace: ingestion-proxy
+  labels:
+    app: ingestion-proxy
+    component: ingestion
+spec:
+  selector:
+    matchLabels:
+      app: ingestion-proxy
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: ingestion-proxy
+        component: ingestion
+    spec:
+      # ── Scheduling ───────────────────────────────────────
+      nodeSelector:
+        ssp-role: under-test
+      tolerations:
+        - operator: Exists
+
+      # ── Graceful shutdown: drain in-flight publishes ──────
+      # 10s NATS drain window + 5s container stop overhead.
+      terminationGracePeriodSeconds: 20
+
+      serviceAccountName: ingestion-proxy
+
+      # ── Host networking: proxy and NATS both live on 127.0.0.1 ─
+      # ztunnel forwards plaintext to 127.0.0.1:{port}; this process
+      # binds those ports. Without hostNetwork the loopback is pod-local,
+      # not reachable from ztunnel running in the host net namespace.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+
+      # Wait for NATS JetStream to be ready before starting the proxy.
+      initContainers:
+        - name: wait-for-nats
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until wget -qO- http://127.0.0.1:8222/healthz >/dev/null 2>&1; do
+                echo "waiting for NATS JetStream..."; sleep 2;
+              done
+              echo "NATS ready"
+
+      containers:
+        - name: proxy
+          # ── Replace with your actual registry/image ───────
+          # Build: docker build -t <registry>/ingestion-proxy:latest infra/ingestion-proxy/
+          # Push:  docker push  <registry>/ingestion-proxy:latest
+          image: ingestion-proxy:latest
+          imagePullPolicy: IfNotPresent
+
+          envFrom:
+            - configMapRef:
+                name: ingestion-proxy-config
+          env:
+            # Pull the NATS password from the Secret, not the ConfigMap.
+            - name: NATS_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: nats-credentials
+                  key: NATS_PASS
+
+          # ── Ports (documentation only; hostNetwork binds directly) ─
+          ports:
+            - name: svc-alpha
+              containerPort: 10001
+              hostPort: 10001
+              protocol: TCP
+            - name: svc-beta
+              containerPort: 10002
+              hostPort: 10002
+              protocol: TCP
+
+          # ── Resource envelope ─────────────────────────────
+          # Proxy is intentionally lean: Tokio I/O threads scale with
+          # connection rate, but each connection is handled in μs.
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+
+          # ── Security context ──────────────────────────────
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop: ["ALL"]
+              # NET_BIND_SERVICE allows binding ports < 1024; not needed
+              # here since service ports are all > 10000.
+
+          # ── Liveness / Readiness ──────────────────────────
+          # The proxy has no HTTP health endpoint (scratch image).
+          # Use a TCP check against the first service port as readiness,
+          # and process-existence as liveness (handled by Kubernetes).
+          readinessProbe:
+            tcpSocket:
+              port: 10001
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: 10001
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 5

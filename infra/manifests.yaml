@@ -6,6 +6,22 @@
 # Then rebuild in-pod binaries (wrk2, churngen) per SETUP_RECOVERY.md §3b — images are bare debian.
 # NOTE: agg-echo goes in ambient ns 'dsb'; loadgen is a SEPARATE non-mesh ns; nodeprobe/bpfbuilder
 # are privileged host-access pods in kube-system.
+#
+# ── Mitigation Architecture Change (pull-based buffer design) ────────────────
+# The Phase-3 reactive connection-rate controller (p3_controller.sh) has been
+# superseded by the Node-Local Pull-Based Asymmetric Buffer design. The three
+# DaemonSets every under-test node now requires are managed in separate files:
+#
+#   nats-jetstream-daemonset.yaml   — NATS JetStream node-local broker
+#   ingestion-proxy-daemonset.yaml  — Rust Multi-Ingress Ingestion Proxy
+#   worker-keda-manifests.yaml      — Pull worker Deployments + KEDA ScaledObjects
+#
+# Apply order:
+#   1. kubectl apply -f nats-jetstream-daemonset.yaml
+#   2. kubectl apply -f ingestion-proxy-daemonset.yaml
+#   3. kubectl apply -f worker-keda-manifests.yaml
+#   4. kubectl apply -f manifests.yaml   (probe pods below)
+# ─────────────────────────────────────────────────────────────────────────────
 ---
 # Disjoint aggressor TARGET (shares ONLY ztunnel with victim; zero app-backend overlap).
 apiVersion: apps/v1
@@ -33,8 +49,9 @@ spec:
   ports: [{port: 8080, targetPort: 5678}]
 ---
 # CHURN aggressor SOURCE (meshed, on under-test node → its new connections are real mTLS
-# handshakes through the shared ztunnel). Rebuild /tmp/churngen[_ctl] here (go build; sources
-# in infra/p3_*.sh, p4_diff.sh). For the BWM comparison (Phase 4) add annotation:
+# handshakes through the shared ztunnel). Rebuild /tmp/churngen here (go build; sources
+# in infra/p3_*.sh, p4_diff.sh). churngen_ctl is no longer used (reactive controller removed).
+# For the BWM comparison (Phase 4) add annotation:
 #   kubernetes.io/egress-bandwidth: "256k"   (recreate pod to change the cap)
 apiVersion: v1
 kind: Pod
