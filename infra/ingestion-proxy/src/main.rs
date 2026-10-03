@@ -44,6 +44,7 @@
 //!   ztunnel then drops the mTLS handshake — matching Phase A / Step 5 of the design.
 //! - **Graceful shutdown**: `SIGTERM` handler drains in-flight publishes before exit.
 
+// Imports
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, stream};
 use bytes::BytesMut;
@@ -62,6 +63,7 @@ use tracing::{error, info, warn};
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// All tunables come from environment variables; no config files needed.
+// Config implements Debug and Deserialize traits.
 #[derive(Debug, Deserialize)]
 struct Config {
     /// NATS server URL — always the local host loopback
@@ -91,6 +93,7 @@ struct Config {
     max_payload_bytes: usize,
 }
 
+// Functions that return values. We can change the values based on our configuration.
 fn default_nats_url() -> String {
     "nats://127.0.0.1:4222".into()
 }
@@ -117,6 +120,7 @@ fn default_max_payload_bytes() -> usize {
 // Service-descriptor: one TCP listener + one NATS subject per service
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ServiceDef implements Debug and Clone traits.
 #[derive(Debug, Clone)]
 struct ServiceDef {
     /// Short service name, e.g. "alpha"
@@ -131,33 +135,33 @@ struct ServiceDef {
 
 /// Parse `SERVICES` env-var into a list of `ServiceDef`.
 fn parse_services(raw: &str) -> Result<Vec<ServiceDef>> {
-    let mut defs = Vec::new();
-    for pair in raw.split(',') {
+    let mut defs = Vec::new(); // Mutable vector to hold ServiceDef instances.
+    for pair in raw.split(',') { // Split the raw string by commas to get each service pair.
         let pair = pair.trim();
         if pair.is_empty() {
             continue;
         }
-        let parts: Vec<&str> = pair.splitn(2, ':').collect();
+        let parts: Vec<&str> = pair.splitn(2, ':').collect(); // Split each pair into name and port based on the first colon.
         anyhow::ensure!(
             parts.len() == 2,
             "invalid service spec {:?}; expected name:port",
             pair
-        );
+        ); // Ensure that we have exactly two parts (name and port), otherwise return an error.
         let name = parts[0].trim().to_string();
         let port: u16 = parts[1]
             .trim()
             .parse()
-            .with_context(|| format!("bad port for service {}", name))?;
-        let subject = format!("local.tasks.{}", name);
-        let stream_name = format!("LOCAL-{}", name.to_ascii_uppercase());
+            .with_context(|| format!("bad port for service {}", name))?; // Parse the port as a u16, returning an error if it fails.
+        let subject = format!("local.tasks.{}", name); // Construct the NATS subject for the service.
+        let stream_name = format!("LOCAL-{}", name.to_ascii_uppercase()); // Construct the NATS stream name for the service.
         defs.push(ServiceDef {
             name,
             port,
             subject,
             stream_name,
-        });
+        }); // Push the constructed ServiceDef into the defs vector.
     }
-    Ok(defs)
+    Ok(defs) // Return the vector of ServiceDef instances wrapped in a Result.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
