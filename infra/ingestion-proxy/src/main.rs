@@ -45,11 +45,12 @@
 //! - **Graceful shutdown**: `SIGTERM` handler drains in-flight publishes before exit.
 
 // Imports
+#![feature(tcp_linger)] 
 use anyhow::{Context, Result};
 use async_nats::jetstream::{self, stream};
 use bytes::BytesMut;
 use serde::Deserialize;
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{collections::HashMap, time::Duration};
 use tokio::{
     io::AsyncReadExt,
     net::TcpListener,
