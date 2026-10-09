@@ -1,0 +1,269 @@
+---
+# ============================================================
+# ztunnel Security Manifests — SSP Ambient Mesh Testbed
+# ============================================================
+# This file establishes the complete L4 security posture for
+# the pull-based asymmetric buffer architecture.
+#
+# Design principles:
+#  1. STRICT mTLS via PeerAuthentication — no plaintext between mesh pods
+#  2. Default-deny AuthorizationPolicy on the dsb namespace
+#  3. Per-service ALLOW rules scoped to exact SPIFFE principals
+#  4. nats-system + ingestion-proxy namespaces explicitly EXCLUDED
+#     from ambient (istio.io/dataplane-mode: none)
+#  5. No sidecar injected anywhere — ztunnel is the sole enforcement point
+#
+# Apply:
+#   kubectl apply -f infra/ztunnel-security.yaml
+#
+# Prerequisites:
+#   - Istio 1.31 ambient installed (ztunnel DaemonSet running)
+#   - Namespace dsb labelled: istio.io/dataplane-mode=ambient
+# ============================================================
+
+# ─────────────────────────────────────────────────────────────
+# Section 1: PeerAuthentication — STRICT mTLS for dsb namespace
+# ─────────────────────────────────────────────────────────────
+# Forces all inter-pod traffic within the dsb namespace through
+# ztunnel's mTLS HBONE tunnel. No plaintext TCP is accepted.
+# ztunnel enforces this before decrypting; any peer without a
+# valid Istio-issued X.509 SVID is rejected at the L4 handshake.
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: dsb-strict-mtls
+  namespace: dsb
+spec:
+  mtls:
+    mode: STRICT
+---
+# ─────────────────────────────────────────────────────────────
+# Section 2: Default-deny AuthorizationPolicy for dsb namespace
+# ─────────────────────────────────────────────────────────────
+# Drops ALL inbound connections to pods in the dsb namespace
+# unless an explicit ALLOW rule matches.
+# This is the zero-trust baseline: ztunnel enforces deny-by-default.
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-all-dsb
+  namespace: dsb
+spec:
+  action: DENY
+  rules:
+    - {}   # matches every request; subordinate ALLOW rules override per-workload
+---
+# ─────────────────────────────────────────────────────────────
+# Section 3a: ALLOW — ingestion proxy → svc-alpha
+# ─────────────────────────────────────────────────────────────
+# Only the Rust ingestion proxy (running under SA ingestion-proxy/ingestion-proxy)
+# may open TCP connections to the svc-alpha virtual endpoint.
+# ztunnel validates the peer SPIFFE SVID against this principal before
+# forwarding the decrypted bytes to 127.0.0.1:10001.
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-ingestion-proxy-alpha
+  namespace: dsb
+spec:
+  selector:
+    matchLabels:
+      app: svc-alpha
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            # SPIFFE SVID: spiffe://cluster.local/ns/ingestion-proxy/sa/ingestion-proxy
+            principals:
+              - "cluster.local/ns/ingestion-proxy/sa/ingestion-proxy"
+      to:
+        - operation:
+            ports: ["10001"]
+---
+# ─────────────────────────────────────────────────────────────
+# Section 3b: ALLOW — ingestion proxy → svc-beta
+# ─────────────────────────────────────────────────────────────
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-ingestion-proxy-beta
+  namespace: dsb
+spec:
+  selector:
+    matchLabels:
+      app: svc-beta
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/ingestion-proxy/sa/ingestion-proxy"
+      to:
+        - operation:
+            ports: ["10002"]
+---
+# ─────────────────────────────────────────────────────────────
+# Section 3c: ALLOW — loadgen → DSB SocialNetwork frontend
+# ─────────────────────────────────────────────────────────────
+# The loadgen pod is outside the mesh (non-ambient namespace).
+# ztunnel wraps its traffic in HBONE using the node's default identity.
+# This policy allows unauthenticated ingress on the nginx/frontend port
+# since the loadgen cannot present a mesh SVID.
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-loadgen-frontend
+  namespace: dsb
+spec:
+  selector:
+    matchLabels:
+      app: nginx-thrift
+  action: ALLOW
+  rules:
+    - to:
+        - operation:
+            ports: ["80", "8080"]
+---
+# ─────────────────────────────────────────────────────────────
+# Section 3d: ALLOW — agg-echo receives aggressor traffic
+# ─────────────────────────────────────────────────────────────
+# The churn aggressor pod (SA: dsb/default) churns connections to agg-echo.
+# Both are in the dsb namespace so they share ztunnel. This policy ensures
+# the aggressor can reach its target without being blocked by deny-all.
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-churn-to-agg-echo
+  namespace: dsb
+spec:
+  selector:
+    matchLabels:
+      app: agg-echo
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/dsb/sa/default"
+      to:
+        - operation:
+            ports: ["8080", "5678"]
+---
+# ─────────────────────────────────────────────────────────────
+# Section 4: PeerAuthentication — PERMISSIVE for nats-system
+# ─────────────────────────────────────────────────────────────
+# nats-system is EXCLUDED from ambient (dataplane-mode: none), so
+# ztunnel does NOT wrap its traffic. Set PERMISSIVE to prevent accidental
+# mesh interception if the label is ever changed.
+# The broker only accepts connections from 127.0.0.1 (loopback) anyway.
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: nats-permissive
+  namespace: nats-system
+spec:
+  mtls:
+    mode: PERMISSIVE
+---
+# ─────────────────────────────────────────────────────────────
+# Section 5: PeerAuthentication — PERMISSIVE for ingestion-proxy
+# ─────────────────────────────────────────────────────────────
+# Same rationale as nats-system: proxy is excluded from ambient,
+# it only listens on loopback ports handed off by ztunnel.
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: ingestion-proxy-permissive
+  namespace: ingestion-proxy
+spec:
+  mtls:
+    mode: PERMISSIVE
+---
+# ─────────────────────────────────────────────────────────────
+# Section 6: Cilium NetworkPolicy — restrict NATS port access
+# ─────────────────────────────────────────────────────────────
+# Belt-and-suspenders: at the CNI layer (Cilium), restrict who can
+# reach NATS ports 4222/8222. Only pods with hostNetwork=true on the
+# same node can reach loopback anyway, but this NetworkPolicy further
+# constrains it to labeled pods.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: nats-loopback-only
+  namespace: nats-system
+spec:
+  podSelector:
+    matchLabels:
+      app: nats-jetstream
+  policyTypes:
+    - Ingress
+  ingress:
+    # Allow from ingestion-proxy namespace (loopback publish)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingestion-proxy
+      ports:
+        - protocol: TCP
+          port: 4222
+    # Allow from dsb namespace (worker pods pull consume)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: dsb
+      ports:
+        - protocol: TCP
+          port: 4222
+    # Allow KEDA scrape of /jsz monitoring endpoint from keda namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: keda
+      ports:
+        - protocol: TCP
+          port: 8222
+    # Allow kubectl / nodeprobe debugging from kube-system
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: TCP
+          port: 8222
+---
+# ─────────────────────────────────────────────────────────────
+# Section 7: NetworkPolicy — restrict ingestion proxy port access
+# ─────────────────────────────────────────────────────────────
+# Only ztunnel (running in host network namespace) should forward
+# to the ingestion proxy loopback listeners. Since ztunnel uses the
+# host network namespace, this NetworkPolicy provides documentation
+# intent rather than hard enforcement (hostNetwork pods bypass it).
+# The real enforcement is the AuthorizationPolicy above.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ingestion-proxy-loopback-only
+  namespace: ingestion-proxy
+spec:
+  podSelector:
+    matchLabels:
+      app: ingestion-proxy
+  policyTypes:
+    - Egress
+  egress:
+    # Allow publish to NATS in nats-system
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: nats-system
+      ports:
+        - protocol: TCP
+          port: 4222
+    # Allow DNS resolution
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
