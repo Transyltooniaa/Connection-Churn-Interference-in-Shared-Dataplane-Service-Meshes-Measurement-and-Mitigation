@@ -26,7 +26,7 @@
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: InitConfiguration
 localAPIEndpoint:
-  advertiseAddress: 192.168.0.2
+  advertiseAddress: 172.20.189.104
   bindPort: 6443
 nodeRegistration:
   criSocket: unix:///var/run/containerd/containerd.sock
@@ -40,7 +40,7 @@ kind: ClusterConfiguration
 clusterName: ssp-p0
 kubernetesVersion: "1.33.0"
 # Single control-plane endpoint (no load-balancer needed for a testbed).
-controlPlaneEndpoint: "192.168.0.2:6443"
+controlPlaneEndpoint: "172.20.189.104:6443"
 networking:
   # Pod CIDR for Cilium VXLAN overlay.
   # IMPORTANT: change if 10.244.0.0/16 overlaps your LAN subnet.
