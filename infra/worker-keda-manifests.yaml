@@ -64,13 +64,14 @@ spec:
 
       containers:
         - name: worker
-          # Replace with your actual worker image.
+          # ── Replace YOUR_DOCKERHUB_USER with your Docker Hub username ──
+          # Build + push:  docker build -t YOUR_DOCKERHUB_USER/worker-alpha:latest <path>
+          #                docker push YOUR_DOCKERHUB_USER/worker-alpha:latest
           # The image must implement a NATS JetStream long-polling loop:
           #   js.subscribe("local.tasks.alpha", { queue: "workers-alpha",
           #                                        maxMessages: 1,
           #                                        wait: 20s })
-          # Reference implementation in infra/worker/ (see worker/README.md).
-          image: worker-alpha:latest
+          image: YOUR_DOCKERHUB_USER/worker-alpha:latest
           imagePullPolicy: IfNotPresent
 
           env:
@@ -158,7 +159,8 @@ spec:
       serviceAccountName: worker-beta
       containers:
         - name: worker
-          image: worker-beta:latest
+          # ── Replace YOUR_DOCKERHUB_USER with your Docker Hub username ──
+          image: YOUR_DOCKERHUB_USER/worker-beta:latest
           imagePullPolicy: IfNotPresent
           env:
             - name: NATS_URL
@@ -252,7 +254,9 @@ spec:
         # The node-local NATS monitoring endpoint.
         # Replace with the actual under-test node IP or use a per-node
         # ScaledObject pattern with KEDA TriggerAuthentication.
-        natsServerMonitoringEndpoint: "http://192.168.11.9:8222"
+        # ── Replace WORKER1_IP with the internal IP of worker-1 (ssp-role=under-test) ──
+        # Run: kubectl get node -l ssp-role=under-test -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}'
+        natsServerMonitoringEndpoint: "http://WORKER1_IP:8222"
         # JetStream stream and consumer identifiers.
         streamName: "LOCAL-ALPHA"
         consumerName: "workers-alpha"
@@ -292,7 +296,8 @@ spec:
   triggers:
     - type: nats-jetstream
       metadata:
-        natsServerMonitoringEndpoint: "http://192.168.11.9:8222"
+        # ── Replace WORKER1_IP with the internal IP of worker-1 (ssp-role=under-test) ──
+        natsServerMonitoringEndpoint: "http://WORKER1_IP:8222"
         streamName: "LOCAL-BETA"
         consumerName: "workers-beta"
         lagThreshold: "50"

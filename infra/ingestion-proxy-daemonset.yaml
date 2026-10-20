@@ -118,10 +118,10 @@ spec:
 
       containers:
         - name: proxy
-          # ── Replace with your actual registry/image ───────
-          # Build: docker build -t <registry>/ingestion-proxy:latest infra/ingestion-proxy/
-          # Push:  docker push  <registry>/ingestion-proxy:latest
-          image: ingestion-proxy:latest
+          # ── Replace YOUR_DOCKERHUB_USER with your Docker Hub username ──
+          # Build: docker build -t YOUR_DOCKERHUB_USER/ingestion-proxy:latest infra/ingestion-proxy/
+          # Push:  docker push YOUR_DOCKERHUB_USER/ingestion-proxy:latest
+          image: YOUR_DOCKERHUB_USER/ingestion-proxy:latest
           imagePullPolicy: IfNotPresent
 
           envFrom:

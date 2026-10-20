@@ -1,0 +1,65 @@
+# ============================================================
+# kubeadm Cluster Bootstrap Configuration
+# SSP Ambient-Mesh Testbed — Bare-Metal (1 controller + 2 workers)
+# ============================================================
+#
+# BEFORE RUNNING — replace ALL placeholders:
+#   CONTROLLER_IP  — control-plane node IP
+#   WORKER1_IP     — worker-1 IP (will be labelled ssp-role=under-test)
+#   WORKER2_IP     — worker-2 IP (will be labelled ssp-role=loadgen)
+#
+# 1. On the CONTROLLER node:
+#      sudo kubeadm init --config infra/kubeadm-config.yaml --upload-certs 2>&1 | tee kubeadm-init.log
+#      mkdir -p $HOME/.kube && sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config
+#      sudo chown $(id -u):$(id -g) $HOME/.kube/config
+#
+# 2. On EACH WORKER node (use the join command printed by init, or):
+#      sudo kubeadm join CONTROLLER_IP:6443 \
+#        --token <token> \
+#        --discovery-token-ca-cert-hash sha256:<hash>
+#
+# 3. Then run: bash infra/install-cilium-ambient.sh
+#
+# Version: Kubernetes 1.33
+# CNI:     Cilium 1.20 (installed after kubeadm init via install-cilium-ambient.sh)
+# ============================================================
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+localAPIEndpoint:
+  advertiseAddress: CONTROLLER_IP
+  bindPort: 6443
+nodeRegistration:
+  criSocket: unix:///var/run/containerd/containerd.sock
+  taints:
+    # Keep the default control-plane taint so no workloads land on the controller.
+    - effect: NoSchedule
+      key: node-role.kubernetes.io/control-plane
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+clusterName: ssp-p0
+kubernetesVersion: "1.33.0"
+# Single control-plane endpoint (no load-balancer needed for a testbed).
+controlPlaneEndpoint: "CONTROLLER_IP:6443"
+networking:
+  # Pod CIDR for Cilium VXLAN overlay.
+  # IMPORTANT: change if 10.244.0.0/16 overlaps your LAN subnet.
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/12"
+  dnsDomain: "cluster.local"
+apiServer:
+  extraArgs:
+    # Required for Cilium BPF + ambient mTLS health probes
+    allow-privileged: "true"
+etcd:
+  local:
+    dataDir: /var/lib/etcd
+dns: {}
+---
+apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
+# systemd cgroup driver is required for Cilium eBPF + cgroup v2 (EDT/BBR).
+cgroupDriver: systemd
+# Disable swap (required for Kubernetes and Cilium stability).
+failSwapOn: true
