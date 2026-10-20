@@ -1,20 +1,29 @@
 # ============================================================
 # kubeadm Cluster Bootstrap Configuration
-# SSP Ambient-Mesh Testbed — Bare-Metal (1 controller + 2 workers)
-# ============================================================
+# SSP Ambient-Mesh Testbed — Tailscale overlay (1 controller + 2 workers)
 #
-# BEFORE RUNNING — replace ALL placeholders:
-#   CONTROLLER_IP  — control-plane node IP
-#   WORKER1_IP     — worker-1 IP (will be labelled ssp-role=under-test)
-#   WORKER2_IP     — worker-2 IP (will be labelled ssp-role=loadgen)
+# Topology:
+#   CONTROLLER : Laptop (Windows host) — runs kubeadm inside WSL2 or SSH'd
+#                into the VMs. The API server listens on the laptop's
+#                Tailscale IP so both VMs can reach it.
+#   WORKER1    : VM-1 on Tailscale  (ssp-role=under-test)
+#   WORKER2    : VM-2 on Tailscale  (ssp-role=loadgen)
 #
-# 1. On the CONTROLLER node:
+# BEFORE RUNNING — replace ALL placeholders in this file:
+#   100.100.CTRL.IP   — laptop's Tailscale IP   (tailscale ip -4  on laptop)
+#   100.100.W1.IP     — VM-1 Tailscale IP
+#   100.100.W2.IP     — VM-2 Tailscale IP
+#
+# Steps:
+# 0. Run infra/node-prereqs.sh on EACH node (controller + both workers)
+#
+# 1. On the CONTROLLER node (inside the Ubuntu/WSL environment that runs kubeadm):
 #      sudo kubeadm init --config infra/kubeadm-config.yaml --upload-certs 2>&1 | tee kubeadm-init.log
 #      mkdir -p $HOME/.kube && sudo cp /etc/kubernetes/admin.conf $HOME/.kube/config
 #      sudo chown $(id -u):$(id -g) $HOME/.kube/config
 #
-# 2. On EACH WORKER node (use the join command printed by init, or):
-#      sudo kubeadm join CONTROLLER_IP:6443 \
+# 2. On EACH WORKER node:
+#      sudo kubeadm join 100.100.CTRL.IP:6443 \
 #        --token <token> \
 #        --discovery-token-ca-cert-hash sha256:<hash>
 #
@@ -26,7 +35,9 @@
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: InitConfiguration
 localAPIEndpoint:
-  advertiseAddress: 172.20.189.104
+  # Use the controller's Tailscale IP so worker VMs can reach the API server.
+  # Find it with: tailscale ip -4
+  advertiseAddress: 100.100.CTRL.IP
   bindPort: 6443
 nodeRegistration:
   criSocket: unix:///var/run/containerd/containerd.sock
@@ -39,15 +50,22 @@ apiVersion: kubeadm.k8s.io/v1beta4
 kind: ClusterConfiguration
 clusterName: ssp-p0
 kubernetesVersion: "1.33.0"
-# Single control-plane endpoint (no load-balancer needed for a testbed).
-controlPlaneEndpoint: "172.20.189.104:6443"
+# Single control-plane endpoint — must be the Tailscale IP of the laptop.
+controlPlaneEndpoint: "100.100.CTRL.IP:6443"
 networking:
   # Pod CIDR for Cilium VXLAN overlay.
-  # IMPORTANT: change if 10.244.0.0/16 overlaps your LAN subnet.
+  # IMPORTANT: change if 10.244.0.0/16 overlaps your LAN or Tailscale subnet.
+  # Tailscale uses 100.64.0.0/10 — 10.244.0.0/16 is safe.
   podSubnet: "10.244.0.0/16"
   serviceSubnet: "10.96.0.0/12"
   dnsDomain: "cluster.local"
 apiServer:
+  # certSANs: the API server TLS cert must be valid for ALL IPs/names
+  # that clients (kubectl, workers) use to reach it.
+  certSANs:
+    - 100.100.CTRL.IP      # laptop Tailscale IP  ← REPLACE
+    - 127.0.0.1
+    - localhost
   extraArgs:
     # Required for Cilium BPF + ambient mTLS health probes
     - name: allow-privileged
