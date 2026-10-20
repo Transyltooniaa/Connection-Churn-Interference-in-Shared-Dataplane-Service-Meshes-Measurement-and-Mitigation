@@ -23,7 +23,6 @@
 # Version: Kubernetes 1.33
 # CNI:     Cilium 1.20 (installed after kubeadm init via install-cilium-ambient.sh)
 # ============================================================
----
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: InitConfiguration
 localAPIEndpoint:
@@ -51,7 +50,8 @@ networking:
 apiServer:
   extraArgs:
     # Required for Cilium BPF + ambient mTLS health probes
-    allow-privileged: "true"
+    - name: allow-privileged
+      value: "true"
 etcd:
   local:
     dataDir: /var/lib/etcd
