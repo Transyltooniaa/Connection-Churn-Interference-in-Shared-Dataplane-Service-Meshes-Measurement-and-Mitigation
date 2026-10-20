@@ -37,7 +37,7 @@ kind: InitConfiguration
 localAPIEndpoint:
   # Use the controller's Tailscale IP so worker VMs can reach the API server.
   # Find it with: tailscale ip -4
-  advertiseAddress: 100.100.CTRL.IP
+  advertiseAddress: 100.120.4.7
   bindPort: 6443
 nodeRegistration:
   criSocket: unix:///var/run/containerd/containerd.sock
@@ -51,7 +51,7 @@ kind: ClusterConfiguration
 clusterName: ssp-p0
 kubernetesVersion: "1.33.0"
 # Single control-plane endpoint — must be the Tailscale IP of the laptop.
-controlPlaneEndpoint: "100.100.CTRL.IP:6443"
+controlPlaneEndpoint: "100.96.31.124:6443"
 networking:
   # Pod CIDR for Cilium VXLAN overlay.
   # IMPORTANT: change if 10.244.0.0/16 overlaps your LAN or Tailscale subnet.
@@ -63,7 +63,7 @@ apiServer:
   # certSANs: the API server TLS cert must be valid for ALL IPs/names
   # that clients (kubectl, workers) use to reach it.
   certSANs:
-    - 100.100.CTRL.IP      # laptop Tailscale IP  ← REPLACE
+    - 100.96.31.124  # laptop Tailscale IP
     - 127.0.0.1
     - localhost
   extraArgs:
