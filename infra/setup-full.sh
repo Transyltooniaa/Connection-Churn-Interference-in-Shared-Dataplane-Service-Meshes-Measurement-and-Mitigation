@@ -160,7 +160,7 @@ curl -s "http://${UT_NODE_IP}:8222/jsz?streams=true" | python3 -m json.tool | gr
 info "=== Step 8: Deploying Workers + KEDA ScaledObjects ==="
 WORKER_MANIFEST=$(mktemp /tmp/worker-XXXXXX.yaml)
 # Patch NATS monitoring endpoint with actual under-test node IP.
-sed "s|WORKER1_IP|${UT_NODE_IP}|g" \
+sed "s|100.117.8.27|${UT_NODE_IP}|g" \
   "${SCRIPT_DIR}/worker-keda-manifests.yaml" > "${WORKER_MANIFEST}"
 kubectl apply -f "${WORKER_MANIFEST}"
 rm -f "${WORKER_MANIFEST}"

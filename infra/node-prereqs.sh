@@ -95,4 +95,4 @@ echo "kubectl:    $(kubectl version --client --short 2>/dev/null || kubectl vers
 echo ""
 echo "Node prereqs complete. Next steps:"
 echo "  CONTROLLER: sudo kubeadm init --config infra/kubeadm-config.yaml --upload-certs"
-echo "  WORKERS:    sudo kubeadm join CONTROLLER_IP:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>"
+echo "  WORKERS:    sudo kubeadm join 192.168.0.2:6443 --token <token> --discovery-token-ca-cert-hash sha256:<hash>"
