@@ -37,7 +37,7 @@ kind: InitConfiguration
 localAPIEndpoint:
   # Use the controller's Tailscale IP so worker VMs can reach the API server.
   # Find it with: tailscale ip -4
-  advertiseAddress: 100.120.4.7
+  advertiseAddress: 100.96.31.124
   bindPort: 6443
 nodeRegistration:
   criSocket: unix:///var/run/containerd/containerd.sock
