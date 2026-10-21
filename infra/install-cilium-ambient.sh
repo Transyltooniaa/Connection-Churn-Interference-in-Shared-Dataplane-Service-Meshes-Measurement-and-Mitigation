@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 # ============================================================
 # install-cilium-ambient.sh
 # SSP Ambient-Mesh Testbed — Bare-Metal (kubeadm)
