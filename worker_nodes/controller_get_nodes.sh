@@ -1,0 +1,1 @@
+sudo kubectl --kubeconfig=/etc/kubernetes/super-admin.conf get nodes -o wide

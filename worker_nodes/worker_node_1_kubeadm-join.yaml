@@ -11,4 +11,4 @@ nodeRegistration:
   criSocket: unix:///run/containerd/containerd.sock
   kubeletExtraArgs:
     - name: node-ip
-      value: "100.114.48.97"
+      value: "100.114.48.94"
