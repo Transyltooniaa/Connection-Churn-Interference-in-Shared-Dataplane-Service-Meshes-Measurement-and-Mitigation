@@ -1,0 +1,14 @@
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: JoinConfiguration
+discovery:
+  bootstrapToken:
+    token: "bzhn8w.61wifd7yzjshgpnh"
+    apiServerEndpoint: "100.96.31.124:6443"
+    caCertHashes:
+      - "sha256:23af3f19f6e4e2c02a38d80afc142345c3e160864f1ef065b0f2d53be4e65455"
+nodeRegistration:
+  name: iiitb-worker2
+  criSocket: unix:///run/containerd/containerd.sock
+  kubeletExtraArgs:
+    - name: node-ip
+      value: "100.117.8.27"
