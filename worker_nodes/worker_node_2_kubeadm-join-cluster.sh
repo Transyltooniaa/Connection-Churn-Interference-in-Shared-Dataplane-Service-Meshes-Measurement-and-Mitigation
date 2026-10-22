@@ -1,0 +1,1 @@
+sudo kubeadm join --config worker_nodes/worker_node_2_kubeadm-join.yaml
