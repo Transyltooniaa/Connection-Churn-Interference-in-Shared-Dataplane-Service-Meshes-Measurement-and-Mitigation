@@ -45,11 +45,14 @@ nodeRegistration:
     # Keep the default control-plane taint so no workloads land on the controller.
     - effect: NoSchedule
       key: node-role.kubernetes.io/control-plane
+  kubeletExtraArgs:
+    - name: node-ip
+      value: "100.96.31.124"
 ---
 apiVersion: kubeadm.k8s.io/v1beta4
 kind: ClusterConfiguration
 clusterName: ssp-p0
-kubernetesVersion: "1.33.0"
+kubernetesVersion: "v1.35.9"
 # Single control-plane endpoint — must be the Tailscale IP of the laptop.
 controlPlaneEndpoint: "100.96.31.124:6443"
 networking:
