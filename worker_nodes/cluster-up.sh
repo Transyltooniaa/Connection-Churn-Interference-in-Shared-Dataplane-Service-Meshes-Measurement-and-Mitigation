@@ -2,11 +2,12 @@
 # SSP Ambient-Mesh testbed:
 #   1. Start the local Kubernetes control plane.
 #   2. Disable active swap and restart kubelet.
-#   3. Start and verify both worker nodes over Tailscale SSH.
-#   4. Install Helm if needed.
-#   5. Install/upgrade Cilium.
-#   6. Wait for all three nodes to become Ready.
-#   7. Optionally install Istio Ambient.
+#   3. Ensure shared root-mount propagation on the laptop and workers.
+#   4. Start and verify both worker nodes over Tailscale SSH.
+#   5. Install Helm if needed.
+#   6. Install/upgrade Cilium and restart its agents to apply host fixes.
+#   7. Wait for all three nodes to become Ready.
+#   8. Optionally install Istio Ambient.
 #
 # Install as <repo>/infra/cluster-up.sh
 #
@@ -22,6 +23,7 @@
 #   - Does NOT run kubeadm init or kubeadm reset.
 #   - Does NOT delete Kubernetes cluster data.
 #   - Disables active swap on the local machine and workers.
+#   - Makes the root mount recursively shared on Linux/WSL hosts for Cilium.
 #   - Does NOT automatically modify the Windows .wslconfig file.
 
 set -Eeuo pipefail
@@ -82,6 +84,28 @@ trap cleanup EXIT
 
 kubectl_local() {
     sudo kubectl --kubeconfig="$KUBECONFIG_PATH" "$@"
+}
+
+# Cilium mounts /var/run/netns from the host. Container runtimes can reject
+# that mount when the host root mount is private. Make root recursively shared
+# and verify the effective setting before installing/restarting Cilium.
+ensure_local_shared_root_mount() {
+    say "Ensuring shared root-mount propagation on the laptop"
+
+    local propagation
+    propagation="$(findmnt -n -o PROPAGATION / 2>/dev/null || true)"
+
+    if [[ "$propagation" != *shared* ]]; then
+        sudo mount --make-rshared / ||
+            die "Could not make the laptop root mount recursively shared. Cilium may fail with the /var/run/netns mount-propagation error."
+    fi
+
+    propagation="$(findmnt -n -o PROPAGATION / 2>/dev/null || true)"
+    if [[ "$propagation" != *shared* ]]; then
+        die "Laptop root mount propagation is '$propagation', not shared. Cannot safely continue with Cilium startup."
+    fi
+
+    echo "Laptop root mount propagation: $propagation"
 }
 
 # ---------------------------------------------------------------------------
@@ -146,6 +170,9 @@ sudo test -r "$KUBECONFIG_PATH" ||
     die "Cannot read $KUBECONFIG_PATH even with sudo. Check that the kubeconfig exists."
 
 have systemctl || die "systemctl is unavailable. Run this inside the laptop's WSL Ubuntu."
+have findmnt || die "findmnt is required to verify mount propagation. Install util-linux if it is missing."
+
+ensure_local_shared_root_mount
 
 # ---------------------------------------------------------------------------
 # Local control plane: Tailscale, containerd, swap, kubelet
@@ -290,6 +317,26 @@ start_worker() {
              exit 20
          fi
 
+         echo 'Ensuring shared root-mount propagation on ${label}'
+         root_propagation=\$(findmnt -n -o PROPAGATION / 2>/dev/null || true)
+         case "\$root_propagation" in
+             *shared*) ;;
+             *)
+                 sudo mount --make-rshared / || {
+                     echo 'ERROR: Could not make root mount recursively shared on ${label}'
+                     exit 24
+                 }
+                 ;;
+         esac
+         root_propagation=\$(findmnt -n -o PROPAGATION / 2>/dev/null || true)
+         case "\$root_propagation" in
+             *shared*) echo '${label} root mount propagation: '"\$root_propagation" ;;
+             *)
+                 echo 'ERROR: Root mount propagation is not shared on ${label}: '"\$root_propagation"
+                 exit 25
+                 ;;
+         esac
+
          echo 'Checking active swap on ${label}'
 
          if sudo swapon --noheadings --show 2>/dev/null | grep -q .; then
@@ -398,6 +445,13 @@ sudo env KUBECONFIG="$KUBECONFIG_PATH" helm upgrade --install cilium cilium/cili
     --set bandwidthManager.enabled=true \
     --set bandwidthManager.bbr=true ||
     die "Cilium Helm installation/upgrade failed. Inspect Helm and Kubernetes logs before retrying."
+
+# The root mount propagation fix is a host-level runtime change. Existing
+# Cilium pods may have been created before that fix, so recreate the DaemonSet
+# pods once to ensure container creation is retried with the corrected mounts.
+say "Restarting Cilium agents to apply host mount-propagation fixes"
+kubectl_local -n kube-system rollout restart daemonset/cilium ||
+    die "Could not restart the Cilium DaemonSet after correcting mount propagation."
 
 # ---------------------------------------------------------------------------
 # Wait for Cilium
