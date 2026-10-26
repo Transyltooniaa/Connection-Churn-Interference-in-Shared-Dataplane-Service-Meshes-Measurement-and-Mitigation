@@ -443,7 +443,7 @@ sudo env KUBECONFIG="$KUBECONFIG_PATH" helm upgrade --install cilium cilium/cili
     --set kubeProxyReplacement=false \
     --set cni.exclusive=false \
     --set bandwidthManager.enabled=true \
-    --set bandwidthManager.bbr=true ||
+    --set bandwidthManager.bbr=false ||
     die "Cilium Helm installation/upgrade failed. Inspect Helm and Kubernetes logs before retrying."
 
 # The root mount propagation fix is a host-level runtime change. Existing
