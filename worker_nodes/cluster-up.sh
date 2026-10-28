@@ -18,6 +18,7 @@
 # Optional environment overrides:
 #   CTRL_IP, WORKER1_IP, WORKER2_IP, WORKER1_SSH, WORKER2_SSH
 #   KUBECONFIG_PATH, CILIUM_VERSION, HELM_VERSION
+#   ISTIO_VERSION, ISTIO_VERSION_EXPECTED
 #
 # Safety:
 #   - Does NOT run kubeadm init or kubeadm reset.
@@ -47,7 +48,8 @@ KUBECONFIG_PATH="${KUBECONFIG_PATH:-/etc/kubernetes/super-admin.conf}"
 
 CILIUM_VERSION="${CILIUM_VERSION:-1.20.2}"
 HELM_VERSION="${HELM_VERSION:-v3.17.3}"
-ISTIO_VERSION_EXPECTED="${ISTIO_VERSION_EXPECTED:-1.31}"
+ISTIO_VERSION="${ISTIO_VERSION:-1.31.3}"
+ISTIO_VERSION_EXPECTED="${ISTIO_VERSION_EXPECTED:-${ISTIO_VERSION%.*}}"
 
 WITH_ISTIO=0
 LOCAL_TS_IP=""
@@ -138,8 +140,12 @@ Environment overrides:
   KUBECONFIG_PATH
   CILIUM_VERSION
   HELM_VERSION
+  ISTIO_VERSION              Istio version to install (default: 1.31.3)
+  ISTIO_VERSION_EXPECTED     Required version prefix (default: 1.31)
 
 This script does not initialize or reset the Kubernetes cluster.
+When --with-istio is supplied, the script installs the matching istioctl
+binary if it is missing or has a different version.
 HELP
             exit 0
             ;;
@@ -529,21 +535,64 @@ fi
 # ---------------------------------------------------------------------------
 
 if [[ "$WITH_ISTIO" -eq 1 ]]; then
-    have istioctl ||
-        die "Kubernetes and Cilium are ready, but istioctl is missing. Install the intended Istio ${ISTIO_VERSION_EXPECTED}.x release, then rerun with --with-istio."
+    # Ensure the requested istioctl version is available locally. This
+    # downloads the official Istio release archive only when needed.
+    istioctl_path="$(command -v istioctl 2>/dev/null || true)"
+    istio_ver=""
 
-    istio_ver="$(istioctl version --remote=false 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$istioctl_path" ]]; then
+        istio_ver="$("$istioctl_path" version --remote=false 2>/dev/null | head -n 1 || true)"
+    fi
+
+    if [[ -z "$istioctl_path" || "$istio_ver" != *"$ISTIO_VERSION"* ]]; then
+        say "Installing istioctl ${ISTIO_VERSION}"
+
+        have uname || die "uname is required to determine the system architecture."
+
+        case "$(uname -m)" in
+            x86_64|amd64)
+                ISTIO_TARGET_ARCH="x86_64"
+                ;;
+            aarch64|arm64)
+                ISTIO_TARGET_ARCH="arm64"
+                ;;
+            *)
+                die "Unsupported architecture '$(uname -m)' for automatic istioctl installation."
+                ;;
+        esac
+
+        TMP_DIR="$(mktemp -d)"
+
+        curl -fsSL https://istio.io/downloadIstio |
+            (
+                cd "$TMP_DIR"
+                ISTIO_VERSION="$ISTIO_VERSION" \
+                TARGET_ARCH="$ISTIO_TARGET_ARCH" sh -
+            ) ||
+            die "Could not download/extract Istio ${ISTIO_VERSION}. Check network access and the requested release version."
+
+        downloaded_istioctl="$TMP_DIR/istio-${ISTIO_VERSION}/bin/istioctl"
+
+        [[ -x "$downloaded_istioctl" ]] ||
+            die "The Istio download did not contain an executable istioctl at the expected path: $downloaded_istioctl"
+
+        sudo install -m 0755 "$downloaded_istioctl" /usr/local/bin/istioctl ||
+            die "Could not install istioctl into /usr/local/bin."
+
+        rm -rf -- "$TMP_DIR"
+        TMP_DIR=""
+        istioctl_path="/usr/local/bin/istioctl"
+        istio_ver="$("$istioctl_path" version --remote=false 2>/dev/null | head -n 1 || true)"
+    fi
 
     echo
     echo "istioctl local version: ${istio_ver:-unknown}"
 
-    if [[ "$istio_ver" != *"${ISTIO_VERSION_EXPECTED}"* ]]; then
+    if [[ "$istio_ver" != *"$ISTIO_VERSION_EXPECTED"* ]]; then
         die "Expected istioctl ${ISTIO_VERSION_EXPECTED}.x, but found '${istio_ver}'. Verify version compatibility before installing Istio."
     fi
 
     say "Installing/upgrading Istio Ambient"
-
-    istioctl_path="$(command -v istioctl)"
 
     sudo env KUBECONFIG="$KUBECONFIG_PATH" \
         "$istioctl_path" install \
