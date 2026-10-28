@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# SSP Ambient-Mesh testbed (college LAN version, no Tailscale):
+# SSP Ambient-Mesh testbed:
 #   1. Start the local Kubernetes control plane.
 #   2. Disable active swap and restart kubelet.
 #   3. Ensure shared root-mount propagation on the laptop and workers.
-#   4. Start and verify both worker nodes over plain SSH on the college network.
+#   4. Start and verify both worker nodes over direct college-network SSH.
 #   5. Install Helm if needed.
 #   6. Install/upgrade Cilium and restart its agents to apply host fixes.
 #   7. Wait for all three nodes to become Ready.
@@ -20,12 +20,23 @@
 #   KUBECONFIG_PATH, CILIUM_VERSION, HELM_VERSION
 #   ISTIO_VERSION, ISTIO_VERSION_EXPECTED
 #
+# College-network defaults:
+#   WORKER1_IP=172.16.203.52
+#   WORKER2_IP=172.16.203.53
+#
 # Safety:
 #   - Does NOT run kubeadm init or kubeadm reset.
 #   - Does NOT delete Kubernetes cluster data.
 #   - Disables active swap on the local machine and workers.
-#   - Makes the root mount recursively shared on Linux/WSL hosts for Cilium.
+#   - Makes the root mount recursively shared on Linux/WSL hosts.
+#   - Does NOT require Tailscale on the laptop or worker VMs.
 #   - Does NOT automatically modify the Windows .wslconfig file.
+#
+# IMPORTANT:
+#   Set CTRL_IP to an IP reachable by the workers on the college network
+#   if the existing control-plane IP is only reachable through Tailscale.
+#   The Kubernetes API endpoint in the kubeconfig and cluster configuration
+#   must also be reachable from the workers.
 
 set -Eeuo pipefail
 
@@ -37,17 +48,15 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 cd "$REPO_ROOT"
 
+# Change CTRL_IP to the control plane's college-network IP if necessary.
+# This default is retained from the original script.
+CTRL_IP="${CTRL_IP:-100.96.31.124}"
+
+# College-network worker VM IPs.
 WORKER1_IP="${WORKER1_IP:-172.16.203.52}"
 WORKER2_IP="${WORKER2_IP:-172.16.203.53}"
 
-# Control-plane IP on the college network. If not supplied, it is detected
-# as the local source address used to reach worker 1.
-CTRL_IP="${CTRL_IP:-}"
-if [[ -z "$CTRL_IP" ]] && command -v ip >/dev/null 2>&1; then
-    CTRL_IP="$(ip -4 route get "$WORKER1_IP" 2>/dev/null |
-        awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}' || true)"
-fi
-
+# Direct SSH over the college network; no Tailscale SSH is required.
 WORKER1_SSH="${WORKER1_SSH:-iiitb@${WORKER1_IP}}"
 WORKER2_SSH="${WORKER2_SSH:-iiitb@${WORKER2_IP}}"
 
@@ -109,6 +118,7 @@ ensure_local_shared_root_mount() {
     fi
 
     propagation="$(findmnt -n -o PROPAGATION / 2>/dev/null || true)"
+
     if [[ "$propagation" != *shared* ]]; then
         die "Laptop root mount propagation is '$propagation', not shared. Cannot safely continue with Cilium startup."
     fi
@@ -132,16 +142,21 @@ Usage:
 
 Starts the existing Kubernetes control plane and worker nodes,
 disables active swap, installs/upgrades Cilium, and checks cluster health.
-Designed for the college network (no Tailscale).
+
+The default worker addresses are:
+  Worker 1: 172.16.203.52
+  Worker 2: 172.16.203.53
+
+Worker SSH uses the college network directly; Tailscale is not required.
 
 Options:
   --with-istio    Install Istio Ambient after Kubernetes and Cilium are ready.
   -h, --help      Show this help.
 
 Environment overrides:
-  CTRL_IP                    Laptop IP on the college network (default: auto-detected)
-  WORKER1_IP                 (default: 172.16.203.52)
-  WORKER2_IP                 (default: 172.16.203.53)
+  CTRL_IP
+  WORKER1_IP
+  WORKER2_IP
   WORKER1_SSH
   WORKER2_SSH
   KUBECONFIG_PATH
@@ -151,6 +166,12 @@ Environment overrides:
   ISTIO_VERSION_EXPECTED     Required version prefix (default: 1.31)
 
 This script does not initialize or reset the Kubernetes cluster.
+
+IMPORTANT:
+  CTRL_IP must be reachable by the workers on the college network.
+  The Kubernetes API endpoint in the kubeconfig and cluster configuration
+  must also be reachable from the workers.
+
 When --with-istio is supplied, the script installs the matching istioctl
 binary if it is missing or has a different version.
 HELP
@@ -173,6 +194,8 @@ have curl || die "curl is required. Install it with: sudo apt-get install curl"
 have tar || die "tar is required. Install it with: sudo apt-get install tar"
 have sha256sum || die "sha256sum is required."
 have ssh || die "SSH is required. Install it with: sudo apt-get install openssh-client"
+have systemctl || die "systemctl is unavailable. Run this inside the laptop's WSL Ubuntu."
+have findmnt || die "findmnt is required to verify mount propagation. Install util-linux if it is missing."
 
 sudo -v || die "Could not obtain sudo privileges."
 
@@ -180,9 +203,6 @@ sudo -v || die "Could not obtain sudo privileges."
 # Check it through sudo instead of checking readability as the normal user.
 sudo test -r "$KUBECONFIG_PATH" ||
     die "Cannot read $KUBECONFIG_PATH even with sudo. Check that the kubeconfig exists."
-
-have systemctl || die "systemctl is unavailable. Run this inside the laptop's WSL Ubuntu."
-have findmnt || die "findmnt is required to verify mount propagation. Install util-linux if it is missing."
 
 ensure_local_shared_root_mount
 
@@ -195,14 +215,9 @@ say "Starting local containerd"
 sudo systemctl start containerd ||
     die "Could not start containerd on the laptop."
 
-[[ -n "$CTRL_IP" ]] ||
-    die "Could not determine the laptop's college-network IP. Are you connected to the college network? You can set it manually: CTRL_IP=<ip> bash infra/cluster-up.sh"
-
-if have ip && ! ip -4 addr show 2>/dev/null | grep -qw "$CTRL_IP"; then
-    warn "Laptop does not appear to have IP '$CTRL_IP' on any interface. Check the network or CTRL_IP."
-fi
-
-echo "Control-plane IP: $CTRL_IP"
+# Tailscale is deliberately not started or checked here.
+# The control plane must be reachable through the configured CTRL_IP
+# and the Kubernetes API endpoint in the kubeconfig.
 
 say "Checking and disabling active swap on the laptop"
 
@@ -288,7 +303,7 @@ kubectl_local get --raw='/readyz' ||
     die "The API readiness endpoint failed."
 
 # ---------------------------------------------------------------------------
-# Worker startup over SSH (college network)
+# Worker startup over direct college-network SSH
 # ---------------------------------------------------------------------------
 
 start_worker() {
@@ -298,16 +313,17 @@ start_worker() {
 
     say "Checking and starting ${label} (${expected_ip})"
 
-    # -tt allocates a terminal so remote sudo can request the worker password.
-    #
     # The remote sequence:
     #   1. Start containerd.
-    #   2. Check that the worker has the expected college-network IP.
+    #   2. Verify that the worker has its expected college-network IP.
     #   3. Disable active swap.
-    #   4. Restart kubelet.
-    #   5. Verify both services are active.
+    #   4. Ensure shared root-mount propagation.
+    #   5. Restart kubelet.
+    #   6. Verify both services are active.
     #
-    # No cluster reset or rejoin is performed.
+    # No Tailscale commands, cluster reset, or rejoin are performed.
+    #
+    # -tt allocates a terminal so remote sudo can request the worker password.
 
     if ! ssh -tt \
         -o ConnectTimeout=10 \
@@ -319,13 +335,22 @@ start_worker() {
 
          sudo systemctl start containerd
 
-         if ! ip -4 addr show 2>/dev/null | grep -qw '${expected_ip}'; then
-             echo 'WARNING: ${label} does not appear to have IP ${expected_ip} on any interface'
+         actual_ips=\$(ip -4 -o addr show scope global 2>/dev/null |
+             awk '{split(\$4, a, \"/\"); print a[1]}' || true)
+
+         if ! printf '%s\n' \"\$actual_ips\" | grep -Fxq '${expected_ip}'; then
+             echo 'ERROR: Expected college-network IP ${expected_ip} was not found on ${label}.'
+             echo 'Detected IPv4 addresses:'
+             printf '%s\n' \"\$actual_ips\"
+             exit 20
          fi
+
+         echo '${label}: verified college-network IP ${expected_ip}.'
 
          echo 'Ensuring shared root-mount propagation on ${label}'
          root_propagation=\$(findmnt -n -o PROPAGATION / 2>/dev/null || true)
-         case "\$root_propagation" in
+
+         case \"\$root_propagation\" in
              *shared*) ;;
              *)
                  sudo mount --make-rshared / || {
@@ -334,11 +359,13 @@ start_worker() {
                  }
                  ;;
          esac
+
          root_propagation=\$(findmnt -n -o PROPAGATION / 2>/dev/null || true)
-         case "\$root_propagation" in
-             *shared*) echo '${label} root mount propagation: '"\$root_propagation" ;;
+
+         case \"\$root_propagation\" in
+             *shared*) echo '${label} root mount propagation: '\"\$root_propagation\" ;;
              *)
-                 echo 'ERROR: Root mount propagation is not shared on ${label}: '"\$root_propagation"
+                 echo 'ERROR: Root mount propagation is not shared on ${label}: '\"\$root_propagation\"
                  exit 25
                  ;;
          esac
@@ -375,12 +402,12 @@ start_worker() {
          echo '${label}: containerd and kubelet are active.'
         "; then
 
-        die "Could not start or verify ${label}. Check that the worker VM is powered on, you are on the college network, SSH works, and remote sudo is available. Target: ${ssh_target}"
+        die "Could not start or verify ${label}. Check that the worker VM is powered on, connected to the college network, reachable over SSH, and configured for remote sudo. Target: ${ssh_target}"
     fi
 }
 
-start_worker "iiitb" "$WORKER1_SSH" "$WORKER1_IP"
-start_worker "iiitb-worker2" "$WORKER2_SSH" "$WORKER2_IP"
+start_worker "worker1" "$WORKER1_SSH" "$WORKER1_IP"
+start_worker "worker2" "$WORKER2_SSH" "$WORKER2_IP"
 
 # ---------------------------------------------------------------------------
 # Install Helm if needed
@@ -456,6 +483,7 @@ sudo env KUBECONFIG="$KUBECONFIG_PATH" helm upgrade --install cilium cilium/cili
 # Cilium pods may have been created before that fix, so recreate the DaemonSet
 # pods once to ensure container creation is retried with the corrected mounts.
 say "Restarting Cilium agents to apply host mount-propagation fixes"
+
 kubectl_local -n kube-system rollout restart daemonset/cilium ||
     die "Could not restart the Cilium DaemonSet after correcting mount propagation."
 
@@ -525,7 +553,8 @@ if [[ "$nodes_ready" -ne 1 ]]; then
     echo
     echo "----- Cilium status -----"
     kubectl_local -n kube-system get pods -o wide || true
-    kubectl_local -n kube-system get events --sort-by='.lastTimestamp' | tail -n 40 || true
+    kubectl_local -n kube-system get events --sort-by='.lastTimestamp' |
+        tail -n 40 || true
 
     die "Cluster startup is incomplete. Use the diagnostics above; do not reset or reinitialize the cluster."
 fi
@@ -541,7 +570,8 @@ if [[ "$WITH_ISTIO" -eq 1 ]]; then
     istio_ver=""
 
     if [[ -n "$istioctl_path" ]]; then
-        istio_ver="$("$istioctl_path" version --remote=false 2>/dev/null | head -n 1 || true)"
+        istio_ver="$("$istioctl_path" version --remote=false 2>/dev/null |
+            head -n 1 || true)"
     fi
 
     if [[ -z "$istioctl_path" || "$istio_ver" != *"$ISTIO_VERSION"* ]]; then
@@ -581,8 +611,10 @@ if [[ "$WITH_ISTIO" -eq 1 ]]; then
 
         rm -rf -- "$TMP_DIR"
         TMP_DIR=""
+
         istioctl_path="/usr/local/bin/istioctl"
-        istio_ver="$("$istioctl_path" version --remote=false 2>/dev/null | head -n 1 || true)"
+        istio_ver="$("$istioctl_path" version --remote=false 2>/dev/null |
+            head -n 1 || true)"
     fi
 
     echo
@@ -648,3 +680,4 @@ kubectl_local get nodes -o wide
 echo
 echo "Active swap was checked and disabled for this run."
 echo "For persistent WSL swap configuration, review the Windows .wslconfig file."
+echo "Worker SSH uses the college network directly; Tailscale is not required."
